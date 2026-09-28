@@ -20,6 +20,9 @@ Config via env (or .env in cwd / ~/.config/opencode-discord/):
     OPENCODE_TIMEOUT    seconds per run (default 600)
     STATE_FILE          default ./state/sessions.json
     GUILD_PREFIX        default "!oc"
+    ATTACH_DIR          default ./attachments (inbound inbox)
+    MAX_ATTACH_MB       default 25 (in/out file size cap)
+    LOG_LEVEL           default INFO (e.g. DEBUG for verbose)
 
 Required Discord privileged intent: Message Content (toggle in the
 Developer Portal -> Bot -> Privileged Gateway Intents).
@@ -27,10 +30,13 @@ Developer Portal -> Bot -> Privileged Gateway Intents).
 
 import asyncio
 import json
+import logging
 import os
 import re
+import shutil
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 try:
@@ -66,6 +72,65 @@ OPENCODE_AUTO = os.environ.get("OPENCODE_AUTO", "0") == "1"
 OPENCODE_TIMEOUT = int(os.environ.get("OPENCODE_TIMEOUT", "600"))
 STATE_FILE = Path(os.environ.get("STATE_FILE", "state/sessions.json"))
 GUILD_PREFIX = os.environ.get("GUILD_PREFIX", "!oc")
+ATTACH_DIR = Path(os.environ.get("ATTACH_DIR", "attachments"))
+MAX_ATTACH_MB = float(os.environ.get("MAX_ATTACH_MB", "25"))
+LOG_LEVEL = os.environ.get("LOG_LEVEL", "INFO").upper()
+
+logging.basicConfig(
+    level=getattr(logging, LOG_LEVEL, logging.INFO),
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    stream=sys.stderr,
+)
+log = logging.getLogger("discord-bot")
+
+# Explicit drop: "place/put/save/drop/move/copy this in(to) <path>"
+# Handled directly by the bot (filesystem move) without involving opencode,
+# so content moderation of the file bytes never comes into play.
+DROP_RE = re.compile(
+    r"^(?:place|put|save|drop|move|copy)\s+"
+    r"(?:this|these|it|them|that|the\s+files?(?:\s+here)?)?\s*"
+    r"(?:in(?:to)?|to)\s+(.+?)\s*$",
+    re.IGNORECASE,
+)
+
+
+def resolve_target_dir(path_str):
+    p = Path(path_str.strip().strip("'\"")).expanduser()
+    if not p.is_absolute():
+        p = (Path(OPENCODE_DIR) / p).resolve()
+    return p
+
+
+# Marker the model emits to send a file back: [[attach:D:\files\clip.mp4]]
+ATTACH_RE = re.compile(r"\[\[attach:(.+?)\]\]", re.IGNORECASE)
+
+# Video is path-only: saved to disk, never passed via --file.
+# The model can't usefully inline video bytes; it just needs the path
+# so shell/file tools can move, copy, or re-send it.
+# NOTE: .gif stays as --file (Discord/opencode treat image/gif as an image).
+PATH_ONLY_EXTS = {
+    ".mp4", ".mov", ".mkv", ".avi", ".webm", ".m4v", ".mpg", ".mpeg",
+    ".wmv", ".flv",
+}
+
+
+def use_file_flag(filename, content_type):
+    ext = Path(filename).suffix.lower()
+    if ext in PATH_ONLY_EXTS:
+        return False
+    if (content_type or "").split(";")[0].strip().lower().startswith("video/"):
+        return False
+    return True
+
+
+BRIDGE_NOTE = (
+    "[Discord bridge: text/code/images (incl. gif) are passed with --file "
+    "AND saved locally; video files (mp4/mov/etc) are NOT inlined - they "
+    "are only saved locally, use shell/file tools on the saved path. "
+    "To send a file back to the user, put [[attach:FULL_PATH]] on its own "
+    "line, e.g. [[attach:D:\\files\\clip.mp4]]. Use absolute paths. "
+    "Only attach files the user asked for or you created for them.]"
+)
 
 if not TOKEN:
     _TOKEN_ERROR = "DISCORD_BOT_TOKEN is not set (env or .env file)"
@@ -117,6 +182,24 @@ def extract_session_id(ndjson_text):
 def strip_json_events(ndjson_text):
     """Pull human-readable text out of opencode JSON event output."""
     parts = []
+    seen_types = set()
+
+    def collect_text(obj, depth=0):
+        # Recursively collect human text; returns list of strings.
+        found = []
+        if isinstance(obj, dict):
+            for k, v in obj.items():
+                if k in ("text", "content", "delta", "message") and isinstance(v, str) and v:
+                    # skip obvious non-text: ids, paths, types
+                    if k == "message" and v in ("step-start",):
+                        continue
+                    found.append(v)
+                elif isinstance(v, (dict, list)):
+                    found.extend(collect_text(v, depth + 1))
+        elif isinstance(obj, list):
+            for item in obj:
+                found.extend(collect_text(item, depth + 1))
+        return found
 
     for line in ndjson_text.splitlines():
         line = line.strip()
@@ -129,22 +212,36 @@ def strip_json_events(ndjson_text):
             parts.append(line)
             continue
 
-        # top-level text fields
-        for key in ("text", "content", "delta", "message"):
-            v = obj.get(key)
-            if isinstance(v, str) and v:
-                parts.append(v)
+        if isinstance(obj, dict):
+            t = obj.get("type")
+            if isinstance(t, str):
+                seen_types.add(t)
+            # skip pure lifecycle events with no text payload
+            part = obj.get("part")
+            if isinstance(part, dict):
+                ptype = part.get("type")
+                if isinstance(ptype, str):
+                    seen_types.add(f"part:{ptype}")
+                text = part.get("text")
+                if isinstance(text, str) and text:
+                    parts.append(text)
+                    continue
+            # fall back to recursive collect for message/result events
+            for s in collect_text(obj):
+                # skip id-like strings and timestamps
+                if s.startswith(("ses_", "prt_", "msg_")):
+                    continue
+                if s in ("step-start", "step-finish", "text"):
+                    continue
+                parts.append(s)
+        else:
+            parts.append(str(obj))
 
-        # opencode v2 event format
-        part = obj.get("part")
-        if isinstance(part, dict):
-            text = part.get("text")
-            if isinstance(text, str) and text:
-                parts.append(text)
-
+    if seen_types:
+        log.debug("opencode event types: %s", sorted(seen_types))
     return "".join(parts).strip()
 
-def run_opencode(prompt, session_key):
+def run_opencode(prompt, session_key, files=None):
     """Run one opencode turn. Returns (reply_text, session_id_or_None)."""
     cmd = [OPENCODE_BIN, "run", "--format", "json"]
     session_id = SESSIONS.get(session_key)
@@ -156,26 +253,40 @@ def run_opencode(prompt, session_key):
         cmd += ["--agent", OPENCODE_AGENT]
     if OPENCODE_AUTO:
         cmd += ["--auto"]
-    cmd.append(prompt)
+    for f in files or []:
+        cmd += ["--file", str(f)]
+    cmd += ["--", prompt]
 
+    log.info("[%s] opencode start: session=%s files=%d timeout=%ds cwd=%s",
+             session_key, session_id or "(new)", len(files or []),
+             OPENCODE_TIMEOUT, OPENCODE_DIR)
+    log.debug("[%s] cmd: %s", session_key, cmd)
+    t0 = time.monotonic()
     try:
         proc = subprocess.run(
             cmd, cwd=OPENCODE_DIR, capture_output=True, text=True,
             timeout=OPENCODE_TIMEOUT)
     except subprocess.TimeoutExpired:
+        log.warning("[%s] opencode timed out after %ds", session_key, OPENCODE_TIMEOUT)
         return (f"opencode timed out after {OPENCODE_TIMEOUT}s. "
                 "Your session is kept; try a smaller task or `!new`."), session_id
     except FileNotFoundError:
+        log.error("[%s] could not execute %r", session_key, OPENCODE_BIN)
         return (f"could not execute `{OPENCODE_BIN}` - is opencode installed "
                 "and on PATH?"), session_id
 
     out = proc.stdout or ""
-    print("=== STDOUT ===")
-    print(out)
-    print("=== STDERR ===")
-    print(proc.stderr)
+    dt = time.monotonic() - t0
+    log.info("[%s] opencode done in %.1fs: rc=%d stdout=%d chars stderr=%d chars",
+             session_key, dt, proc.returncode, len(out),
+             len(proc.stderr or ""))
+    log.debug("[%s] stdout:\n%s", session_key, out)
+    if proc.stderr:
+        log.debug("[%s] stderr:\n%s", session_key, proc.stderr)
     new_sid = extract_session_id(out) or session_id
     text = strip_json_events(out).strip()
+    log.info("[%s] agent reply (%d chars): %r", session_key, len(text),
+             text[:1500])
     if proc.returncode != 0 and not text:
         err = (proc.stderr or "").strip()[-1500:]
         text = f"opencode exited with code {proc.returncode}."
@@ -184,6 +295,26 @@ def run_opencode(prompt, session_key):
     if not text:
         text = "(opencode returned no text)"
     return text, new_sid
+
+
+def safe_key(key):
+    return re.sub(r"[^A-Za-z0-9_-]+", "_", key)
+
+
+def split_attach_markers(reply):
+    """Strip [[attach:path]] markers. Returns (clean_text, [paths])."""
+    paths = [m.group(1).strip().strip("'\"") for m in ATTACH_RE.finditer(reply)]
+    clean = ATTACH_RE.sub("", reply).strip()
+    # collapse 3+ blank lines left behind by removed markers
+    clean = re.sub(r"\n{3,}", "\n\n", clean)
+    return clean, paths
+
+
+def resolve_outbound(path_str):
+    p = Path(path_str.strip().strip("'\"")).expanduser()
+    if not p.is_absolute():
+        p = (Path(OPENCODE_DIR) / p).resolve()
+    return p
 
 
 def chunk(text, n=MAX_DISCORD):
@@ -212,7 +343,7 @@ def session_key_for(message):
 
 @client.event
 async def on_ready():
-    print(f"logged in as {client.user} (id {client.user.id})")
+    log.info("logged in as %s (id %s)", client.user, client.user.id)
 
 
 @client.event
@@ -235,14 +366,16 @@ async def on_message(message):
         # strip a leading mention
         content = re.sub(rf"^<@!?{client.user.id}>\s*", "", content).strip()
 
-    if not content:
+    if not content and not message.attachments:
         return
 
     if content.lower() in ("!help", "help"):
         await message.channel.send(
             "DM me anything and I'll run it through opencode.\n"
             "`!new` - start a fresh opencode session\n"
-            f"`{GUILD_PREFIX} <prompt>` - use me in a server channel")
+            f"`{GUILD_PREFIX} <prompt>` - use me in a server channel\n"
+            "Attachments are forwarded to opencode. To get a file back, "
+            "ask for it by path, e.g. `send me D:\\files\\clip.mp4`.")
         return
 
     key = session_key_for(message)
@@ -252,14 +385,169 @@ async def on_message(message):
         await message.channel.send("fresh opencode session started.")
         return
 
-    prompt = content
+    log.info("[%s] msg from %s (%d attach, %d chars): %r",
+             key, message.author, len(message.attachments), len(content),
+             content[:200])
+
+    status = None
+    if message.attachments:
+        status = await message.channel.send(
+            f"got {len(message.attachments)} attachment(s), saving...")
+
     async with message.channel.typing():
-        reply, new_sid = await asyncio.to_thread(run_opencode, prompt, key)
+        # --- inbound attachments: save + pass via --file ---
+        inbox = ATTACH_DIR / safe_key(key)
+        inbox.mkdir(parents=True, exist_ok=True)
+        local_files = []
+        saved_files = []
+        attach_notes = []
+        for att in message.attachments:
+            size_mb = (att.size or 0) / (1024 * 1024)
+            log.info("[%s] inbound: %s (%d bytes, %s)",
+                     key, att.filename, att.size, att.content_type)
+            if size_mb > MAX_ATTACH_MB:
+                log.warning("[%s] inbound skipped (too big): %s %.1fMB",
+                            key, att.filename, size_mb)
+                attach_notes.append(
+                    f"[Attachment skipped: {att.filename} ({size_mb:.1f}MB "
+                    f"exceeds {MAX_ATTACH_MB:g}MB limit)]")
+                continue
+            orig_stem = Path(att.filename).stem
+            orig_suffix = Path(att.filename).suffix
+            dest = inbox / att.filename
+            # avoid overwriting: file(1).ext (keep original stem)
+            i = 1
+            while dest.exists():
+                dest = inbox / f"{orig_stem}({i}){orig_suffix}"
+                i += 1
+            try:
+                log.info("[%s] saving -> %s", key, dest.resolve())
+                await att.save(dest)
+                log.info("[%s] saved %d bytes -> %s",
+                         key, dest.stat().st_size, dest.resolve())
+                saved_files.append(str(dest.resolve()))
+                if use_file_flag(att.filename, att.content_type):
+                    local_files.append(str(dest.resolve()))
+                    attach_notes.append(
+                        f"[Attached file: {att.filename} ({att.size} bytes, "
+                        f"{att.content_type or 'unknown type'}) saved at {dest.resolve()}]")
+                else:
+                    log.info("[%s] path-only (video, no --file): %s",
+                             key, dest.resolve())
+                    attach_notes.append(
+                        f"[Attached video: {att.filename} ({att.size} bytes) "
+                        f"saved at {dest.resolve()} - NOT inlined, "
+                        f"use shell/file tools on this path]")
+            except Exception as e:
+                log.exception("[%s] save failed: %s", key, att.filename)
+                attach_notes.append(
+                    f"[Attachment failed: {att.filename}: {e}]")
+
+        if status is not None:
+            try:
+                await status.edit(
+                    content=f"saved {len(saved_files)}/{len(message.attachments)} "
+                            "file(s), asking opencode...")
+            except Exception:
+                pass
+
+        # --- direct drop: "place this in <dir>" moves files, no opencode ---
+        drop = DROP_RE.match(content) if saved_files else None
+        if drop:
+            target = resolve_target_dir(drop.group(1))
+            log.info("[%s] direct drop: %d file(s) -> %s", key, len(saved_files), target)
+            try:
+                target.mkdir(parents=True, exist_ok=True)
+            except Exception as e:
+                log.exception("[%s] drop mkdir failed: %s", key, target)
+                if status is not None:
+                    try:
+                        await status.delete()
+                    except Exception:
+                        pass
+                await message.channel.send(f"could not create {target}: {e}")
+                return
+            moved, errs = [], []
+            for src in saved_files:
+                try:
+                    dst = target / Path(src).name
+                    j = 1
+                    stem, suf = dst.stem, dst.suffix
+                    while dst.exists():
+                        dst = target / f"{stem}({j}){suf}"
+                        j += 1
+                    shutil.move(src, dst)
+                    moved.append(dst)
+                    log.info("[%s] moved %s -> %s", key, src, dst)
+                except Exception as e:
+                    log.exception("[%s] move failed: %s", key, src)
+                    errs.append(f"{Path(src).name}: {e}")
+            if status is not None:
+                try:
+                    await status.delete()
+                except Exception:
+                    pass
+            lines = [f"moved {len(moved)} file(s) to `{target}`:"]
+            lines += [f"- `{p.name}`" for p in moved]
+            lines += [f"(failed: {e})" for e in errs]
+            await message.channel.send("\n".join(lines))
+            return
+
+        prompt = content
+        if attach_notes:
+            prompt = (prompt + "\n" if prompt else "") + "\n".join(attach_notes)
+        prompt = f"{prompt}\n{BRIDGE_NOTE}" if prompt else BRIDGE_NOTE
+
+        log.info("[%s] opencode prompt: %d chars + %d files (--file=%s)",
+                 key, len(prompt), len(local_files), local_files)
+        log.debug("[%s] prompt attach notes:\n%s", key, "\n".join(attach_notes) or "(none)")
+        log.debug("[%s] full prompt:\n%s", key, prompt[:3000])
+        reply, new_sid = await asyncio.to_thread(
+            run_opencode, prompt, key, local_files)
     if new_sid and new_sid != SESSIONS.get(key):
         SESSIONS[key] = new_sid
         save_state(SESSIONS)
+        log.info("[%s] session: %s", key, new_sid)
+
+    # --- outbound attachments: [[attach:path]] -> discord.File ---
+    reply, out_paths = split_attach_markers(reply)
+    log.info("[%s] reply: %d chars, %d attach marker(s): %s",
+             key, len(reply), len(out_paths), out_paths)
+    errors = []
+    outbound = []
+    for pstr in out_paths:
+        p = resolve_outbound(pstr)
+        log.info("[%s] outbound: %r -> %s", key, pstr, p)
+        if not p.is_file():
+            log.warning("[%s] outbound missing: %s", key, p)
+            errors.append(f"(could not attach {pstr}: file not found)")
+            continue
+        if p.stat().st_size > MAX_ATTACH_MB * 1024 * 1024:
+            log.warning("[%s] outbound too big: %s %d bytes",
+                        key, p, p.stat().st_size)
+            errors.append(
+                f"(could not attach {p.name}: exceeds {MAX_ATTACH_MB:g}MB limit)")
+            continue
+        outbound.append(p)
+    if errors:
+        reply = (reply + "\n" if reply else "") + "\n".join(errors)
+
+    if status is not None:
+        try:
+            await status.delete()
+        except Exception:
+            pass
+
     for part in chunk(reply):
         await message.channel.send(part)
+    for p in outbound:
+        log.info("[%s] uploading %s (%d bytes)", key, p, p.stat().st_size)
+        try:
+            await message.channel.send(file=discord.File(str(p)))
+            log.info("[%s] uploaded %s", key, p)
+        except Exception as e:
+            log.exception("[%s] upload failed: %s", key, p)
+            await message.channel.send(f"(failed to attach {p.name}: {e})")
 
 
 if __name__ == "__main__":
