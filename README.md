@@ -18,7 +18,7 @@ Two-way chat between Discord and opencode. DM the bot, it forwards to `opencode 
 1. Discord Developer Portal -> your app -> Bot:
    - Copy the token.
    - Enable **Privileged Gateway Intent: Message Content**.
-   - Invite the bot to your server (bot scope, Send Messages / Read Messages / Attach Files) or just DM it.
+   - Invite the bot to your server (bot scope, Send Messages / Read Messages / Attach Files / Add Reactions) or just DM it.
 2. Install:
    ```
    pip install -r requirements.txt
@@ -60,6 +60,13 @@ Two-way chat between Discord and opencode. DM the bot, it forwards to `opencode 
 
 `sample.env` shows the same knobs.
 
+## Behavior
+
+- **Reacts:** hourglass on your message means it's accepted and working; check means done; cross means something failed (details in console).
+- **Coalescing:** if you send more messages while a turn is running, they merge into a single follow-up turn (separated by `---`) instead of one run each. The follow-up reply covers everything merged. To force separate turns, wait for the check react first.
+- **Presence:** Listening while idle, DND "working..." while any turn runs.
+- **Guild sessions are shared:** everyone talking to the bot in one channel shares that channel's opencode session.
+
 ## Attachments
 
 **Direct drop (no model involved):** attach file(s) with `place / put / save / drop / move / copy this in(to) <dir>` (e.g. `Place this in d:/projects`). The bot saves to `attachments/<dm_or_channel>/`, creates the target dir, moves the files, and confirms. opencode is never called, so filename/content moderation can't refuse.
@@ -84,7 +91,7 @@ python discord-send.py --to '#ops' --subject "Nightly" --file out.txt
 python discord-send.py --list
 ```
 
-With `DEFAULT_DISCORD_CHANNEL` set in `.env`, omit `--to`. Targets: `#name`, `<channel_id>`, `channel:<id>`, `dm:<user_id>`, `user:<id>`, `@<id>`. Exit codes: 0 ok, 1 delivery failure, 2 usage error.
+With `DEFAULT_DISCORD_CHANNEL` set in `.env`, omit `--to`. Targets: `#name`, `<channel_id>`, `channel:<id>`, `dm:<user_id>`, `user:<id>`, `@<id>`. Exit codes: 0 ok, 1 delivery failure, 2 usage error. Requires `chunking.py` alongside for fence-aware splitting.
 
 ## Troubleshooting
 
@@ -92,4 +99,5 @@ With `DEFAULT_DISCORD_CHANNEL` set in `.env`, omit `--to`. Targets: `#name`, `<c
 - **"unable to help" / content refusal on file moves**: use the direct drop form (attach + `Place this in d:/projects`) — it bypasses the model entirely. Same for sends: `send me D:\files\clip.mp4` uploads without asking the model.
 - **"I don't see any file" / stuck refusal**: the opencode session predates the fix or a failed turn. Send `!new`, then resend the file fresh. Session continuity (`--session`) keeps old context otherwise.
 - **`mkgy2(1)(2)(3).gif`**: same filename re-sent repeatedly; the inbox dedups instead of overwriting. Safe to delete `attachments/` contents.
+- **My messages got answered together**: that's coalescing — arrivals during a running turn merge into one follow-up. Wait for the check react between messages for separate turns.
 - **No reply at all**: check stderr logs (`[dm:...]` / `[guild:...]` lines), verify Message Content intent is on, and that your user id is in `ALLOWED_USER_IDS` (anyone else is silently ignored).
