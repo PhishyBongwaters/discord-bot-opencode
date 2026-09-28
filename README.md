@@ -6,6 +6,7 @@ Two-way chat between Discord and opencode. DM the bot, it forwards to `opencode 
 - Servers: `@bot` mention or `!oc <prompt>` (per-channel session)
 - `!new`: start a fresh opencode session (plain message with `!`, **not** `/new` — there are no slash commands)
 - `!status`: session id, turns, tokens, cost, inbox, queue state
+- `/sessions`: dropdown browser to switch opencode sessions (servers; DMs after global sync)
 - `!help`: usage
 - Reactions: hourglass while working, check when done, cross on failure
 - Dynamic presence: Listening when idle, DND "working..." while any turn runs
@@ -19,7 +20,7 @@ Two-way chat between Discord and opencode. DM the bot, it forwards to `opencode 
 1. Discord Developer Portal -> your app -> Bot:
    - Copy the token.
    - Enable **Privileged Gateway Intent: Message Content**.
-   - Invite the bot to your server (bot scope, Send Messages / Read Messages / Attach Files / Add Reactions) or just DM it.
+   - Invite the bot to your server (bot scope, Send Messages / Read Messages / Attach Files / Add Reactions) or just DM it. For slash commands (`/sessions`), the invite must also include the `applications.commands` scope — re-invite if `/sessions` doesn't appear.
 2. Install:
    ```
    pip install -r requirements.txt
@@ -82,6 +83,12 @@ Two-way chat between Discord and opencode. DM the bot, it forwards to `opencode 
 **Outbound via opencode:** the model emits `[[attach:D:\files\clip.mp4]]` on its own line; the bot strips the marker and uploads. Markers pointing at nonexistent files are silently skipped (quoted doc examples must never spam the channel); oversize files come back as text errors. The model can also react to your message with `[[react:EMOJI]]` (literal emoji, or custom `<:name:id>`; max 5 per turn, invalid ones are skipped with a console warning).
 
 Model-driven moves/writes require `OPENCODE_AUTO=1` (or an agent that can approve file tools).
+
+## Slash commands
+
+`/sessions` shows a dropdown of the bot project's opencode sessions (newest first, via `opencode session list`). Each entry is tagged `[bot]` (the bot has used it in this chat) or `[cli]` (terminal/other), with the active session starred. Pick one to switch this chat to it, or `+ New session` for a fresh start. Everything is ephemeral (only you see it).
+
+Notes: per-guild sync is instant on startup; global sync (which covers DMs) can take up to an hour to propagate. Session listing is project-scoped to `OPENCODE_DIR` — terminal sessions in other directories won't appear.
 
 ## discord-send.py
 

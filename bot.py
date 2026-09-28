@@ -50,12 +50,14 @@ import subprocess
 import sys
 import tempfile
 import time
+from datetime import datetime
 from pathlib import Path
 
 from chunking import split_smart
 
 try:
     import discord
+    from discord import app_commands
 except ImportError:
     sys.exit("discord.py not installed: pip install -r requirements.txt")
 
@@ -206,18 +208,40 @@ if not ALLOWED:
 
 
 def load_state():
+    """State shape: {"active": {key: sid}, "known": {key: [sid, ...]}}."""
     try:
-        return json.loads(STATE_FILE.read_text())
+        raw = json.loads(STATE_FILE.read_text())
     except (OSError, json.JSONDecodeError):
-        return {}
+        return {"active": {}, "known": {}}
+    if isinstance(raw, dict) and isinstance(raw.get("active"), dict):
+        known = raw.get("known")
+        return {"active": raw["active"],
+                "known": known if isinstance(known, dict) else {}}
+    # legacy flat {key: sid}
+    act = ({k: v for k, v in raw.items() if isinstance(v, str)}
+           if isinstance(raw, dict) else {})
+    return {"active": act, "known": {k: [v] for k, v in act.items()}}
 
 
-def save_state(state):
+def save_state():
     STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
-    STATE_FILE.write_text(json.dumps(state, indent=2))
+    STATE_FILE.write_text(json.dumps({"active": SESSIONS, "known": KNOWN},
+                                     indent=2))
 
 
-SESSIONS = load_state()  # key -> opencode session id
+_STATE = load_state()
+SESSIONS = _STATE["active"]  # key -> opencode session id
+KNOWN = _STATE["known"]  # key -> [opencode session ids the bot has used]
+
+
+def remember_session(key, sid):
+    if not sid:
+        return
+    lst = KNOWN.setdefault(key, [])
+    if sid in lst:
+        lst.remove(sid)
+    lst.append(sid)
+    del lst[:-30]
 USAGE = {}  # key -> {"in": int, "out": int, "cost": float, "turns": int}
 
 
@@ -270,6 +294,7 @@ def get_queue(key):
 
 ACTIVE_TURNS = 0
 ACTIVE_GUARD = asyncio.Lock()
+TREE_SYNCED = False
 
 IDLE_ACTIVITY = discord.Activity(
     type=discord.ActivityType.listening, name="DMs | !oc in servers")
@@ -518,6 +543,7 @@ intents.message_content = True
 intents.dm_messages = True
 
 client = discord.Client(intents=intents)
+tree = app_commands.CommandTree(client)
 
 
 def session_key_for(message):
@@ -669,7 +695,8 @@ async def run_batches(key, channel, q, batch, inbox, status):
                     run_opencode, combined, key, files)
             if new_sid and new_sid != SESSIONS.get(key):
                 SESSIONS[key] = new_sid
-                save_state(SESSIONS)
+                remember_session(key, new_sid)
+                save_state()
                 log.info("[%s] session: %s", key, new_sid)
             await deliver_reply(key, channel, msgs, reply, inbox, status)
             status = None
@@ -695,10 +722,143 @@ async def run_batches(key, channel, q, batch, inbox, status):
             await update_presence()
 
 
+def list_sessions(limit=25):
+    """Live `opencode session list` for the bot project. None on failure."""
+    try:
+        proc = subprocess.run(
+            [OPENCODE_BIN, "session", "list", "--format", "json",
+             "-n", str(limit)],
+            cwd=OPENCODE_DIR, capture_output=True, text=True,
+            encoding="utf-8", errors="replace", timeout=30)
+    except (subprocess.TimeoutExpired, FileNotFoundError, OSError) as e:
+        log.warning("session list failed: %s", e)
+        return None
+    if proc.returncode != 0:
+        log.warning("session list rc=%d: %s", proc.returncode,
+                    (proc.stderr or "")[:500])
+        return None
+    try:
+        data = json.loads(proc.stdout or "[]")
+    except json.JSONDecodeError:
+        return None
+    return data if isinstance(data, list) else None
+
+
+def build_session_options(entries, key, max_options=24):
+    """Pure render: [(label, description, sid)] with origin + active star."""
+    active = SESSIONS.get(key)
+    known = set(KNOWN.get(key, []))
+    opts = []
+    for e in entries[:max_options]:
+        if not isinstance(e, dict):
+            continue
+        sid = e.get("id", "")
+        if not sid:
+            continue
+        star = "* " if sid == active else ""
+        origin = "bot" if sid in known else "cli"
+        try:
+            dt = datetime.fromtimestamp(
+                int(e.get("updated", 0) or 0) / 1000).strftime("%d/%m %H:%M")
+        except (ValueError, TypeError, OSError):
+            dt = "?"
+        title = str(e.get("title") or "(untitled)")
+        opts.append((f"{star}{title}"[:100], f"[{origin}] {dt}"[:100], sid))
+    return opts
+
+
+class SessionPicker(discord.ui.View):
+    def __init__(self, key, options, titles, timeout=120):
+        super().__init__(timeout=timeout)
+        self.key = key
+        self.titles = titles
+        self.sel = discord.ui.Select(
+            placeholder="Pick an opencode session…",
+            min_values=1, max_values=1)
+        for label, desc, sid in options:
+            self.sel.add_option(label=label, description=desc, value=sid)
+        self.sel.add_option(label="+ New session",
+                            description="Start fresh on next message",
+                            value="__new__")
+        self.sel.callback = self.picked
+        self.add_item(self.sel)
+
+    async def picked(self, interaction: discord.Interaction):
+        sid = self.sel.values[0]
+        if sid == "__new__":
+            SESSIONS.pop(self.key, None)
+            USAGE.pop(self.key, None)
+            save_state()
+            log.info("[%s] session reset via picker", self.key)
+            await interaction.response.send_message(
+                "fresh opencode session started - next message starts it.",
+                ephemeral=True)
+            return
+        SESSIONS[self.key] = sid
+        remember_session(self.key, sid)
+        save_state()
+        log.info("[%s] session switched via picker: %s", self.key, sid)
+        await interaction.response.send_message(
+            f"switched to `{self.titles.get(sid, sid)}`.",
+            ephemeral=True)
+
+
+@tree.command(name="sessions",
+                     description="Browse and switch opencode sessions")
+async def sessions_cmd(interaction: discord.Interaction):
+    if ALLOWED and str(interaction.user.id) not in ALLOWED:
+        await interaction.response.send_message(
+            "not allowed.", ephemeral=True)
+        return
+    ch = interaction.channel
+    if ch is None:
+        key = f"dm:{interaction.user.id}"
+    elif isinstance(ch, discord.DMChannel):
+        key = f"dm:{interaction.user.id}"
+    else:
+        key = f"guild:{interaction.channel_id}"
+    await interaction.response.defer(ephemeral=True)
+    entries = await asyncio.to_thread(list_sessions)
+    if entries is None:
+        known = list(KNOWN.get(key, []))
+        if SESSIONS.get(key) and SESSIONS[key] not in known:
+            known = [SESSIONS[key]] + known
+        if not known:
+            await interaction.followup.send(
+                "opencode session list unreachable and nothing remembered.",
+                ephemeral=True)
+            return
+        entries = [{"id": s, "title": s, "updated": 0} for s in known[:24]]
+    options = build_session_options(entries, key)
+    if not options:
+        await interaction.followup.send(
+            "no sessions found.", ephemeral=True)
+        return
+    titles = {sid: label.lstrip("* ") for label, _, sid in options}
+    await interaction.followup.send(
+        "Pick an opencode session for this chat "
+        "(`*` = current, `+ New session` = fresh):",
+        view=SessionPicker(key, options, titles), ephemeral=True)
+
+
 @client.event
 async def on_ready():
     log.info("logged in as %s (id %s)", client.user, client.user.id)
     await update_presence()
+    global TREE_SYNCED
+    if not TREE_SYNCED:
+        TREE_SYNCED = True
+        for g in client.guilds:
+            try:
+                n = await tree.sync(guild=g)
+                log.info("slash synced to %s: %d cmd(s)", g.name, len(n))
+            except Exception as e:
+                log.warning("guild sync failed (%s): %s", g.name, e)
+        try:
+            await tree.sync()
+            log.info("slash synced globally (DMs can take up to an hour)")
+        except Exception as e:
+            log.warning("global sync failed: %s", e)
 
 
 @client.event
@@ -735,7 +895,8 @@ async def on_message(message):
             f"`{GUILD_PREFIX} <prompt>` - use me in a server channel\n"
             "Attach + `place this in <dir>` saves files directly.\n"
             "`send me <path>` sends a file back directly.\n"
-            "Rapid messages merge into one follow-up - wait for the check."
+            "Rapid messages merge into one follow-up - wait for the check.\n"
+            "`/sessions` - browse and switch opencode sessions (servers)."
             + extra)
         return
 
@@ -743,7 +904,7 @@ async def on_message(message):
     if content.lower() == "!new":
         SESSIONS.pop(key, None)
         USAGE.pop(key, None)
-        save_state(SESSIONS)
+        save_state()
         extra = (f" ({len(message.attachments)} attached file(s) ignored - "
                  "resend them now.)" if message.attachments else "")
         await message.channel.send("fresh opencode session started." + extra)
