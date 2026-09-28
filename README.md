@@ -7,7 +7,8 @@ Two-way chat between Discord and opencode. DM the bot, it forwards to `opencode 
 - `!new`: start a fresh opencode session (plain message with `!`, **not** `/new` — there are no slash commands)
 - `!help`: usage
 - Reactions: hourglass while working, check when done, cross on failure
-- Per-session turn queue (rapid messages run in order, not concurrently)
+- Dynamic presence: Listening when idle, DND "working..." while any turn runs
+- Per-session coalescing queue (a message arriving mid-turn merges into one follow-up, not its own run)
 - Fence-aware chunking (`chunking.py`, shared with the sender) + long replies sent as `reply.md`
 - Attachments in both directions (direct drop/send bypass the model)
 - `discord-send.py`: one-shot sender for shell/opencode (REST only, no gateway)

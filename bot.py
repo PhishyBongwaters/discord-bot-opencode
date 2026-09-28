@@ -7,6 +7,9 @@
 - Direct file drops ("place this in <dir>" + attachments) move files
   without involving opencode, so model content moderation never applies.
 - Direct sends ("send me <path>") upload without involving opencode.
+- Rapid messages coalesce: arrivals during a running turn merge into a
+  single follow-up turn per session instead of queueing N runs.
+- Presence: Listening when idle, DND "working..." while any turn runs.
 - Other attachments go to opencode via --file (text/code/images incl.
   gif) or path-only (video); `[[attach:path]]` markers come back as files.
 - No Hermes, no gateway besides this bot. discord-send (sibling script)
@@ -185,15 +188,47 @@ def save_state(state):
 
 SESSIONS = load_state()  # key -> opencode session id
 
-LOCKS = {}  # key -> asyncio.Lock (one opencode turn at a time per session)
+
+class TurnQueue:
+    """Per-session coalescing queue: one runner at a time, late arrivals
+    merge into a single follow-up turn instead of queueing N runs."""
+    __slots__ = ("guard", "running", "buffer")
+
+    def __init__(self):
+        self.guard = asyncio.Lock()
+        self.running = False
+        self.buffer = []  # [(message, prompt, files)]
 
 
-def get_lock(key):
-    lock = LOCKS.get(key)
-    if lock is None:
-        lock = asyncio.Lock()
-        LOCKS[key] = lock
-    return lock
+QUEUES = {}
+
+
+def get_queue(key):
+    q = QUEUES.get(key)
+    if q is None:
+        q = TurnQueue()
+        QUEUES[key] = q
+    return q
+
+
+ACTIVE_TURNS = 0
+ACTIVE_GUARD = asyncio.Lock()
+
+IDLE_ACTIVITY = discord.Activity(
+    type=discord.ActivityType.listening, name="DMs | !oc in servers")
+BUSY_ACTIVITY = discord.Game("working on your request...")
+
+
+async def update_presence():
+    try:
+        if ACTIVE_TURNS > 0:
+            await client.change_presence(
+                status=discord.Status.dnd, activity=BUSY_ACTIVITY)
+        else:
+            await client.change_presence(
+                status=discord.Status.online, activity=IDLE_ACTIVITY)
+    except Exception as e:
+        log.warning("presence update failed: %s", e)
 
 
 def extract_session_id(ndjson_text):
@@ -389,9 +424,134 @@ async def swap_react(message, old, new):
     await react(message, new)
 
 
+async def deliver_reply(key, channel, messages, reply, inbox, status):
+    """Send one turn's reply + outbound files. Swaps working reacts."""
+    # --- outbound attachments: [[attach:path]] -> discord.File ---
+    reply, out_paths = split_attach_markers(reply)
+    log.info("[%s] reply: %d chars, %d attach marker(s): %s",
+             key, len(reply), len(out_paths), out_paths)
+    errors = []
+    outbound = []
+    for pstr in out_paths:
+        p = resolve_outbound(pstr)
+        log.info("[%s] outbound: %r -> %s", key, pstr, p)
+        if not p.is_file():
+            log.warning("[%s] outbound missing: %s", key, p)
+            errors.append(f"(could not attach {pstr}: file not found)")
+            continue
+        if p.stat().st_size > MAX_ATTACH_MB * 1024 * 1024:
+            log.warning("[%s] outbound too big: %s %d bytes",
+                        key, p, p.stat().st_size)
+            errors.append(
+                f"(could not attach {p.name}: exceeds {MAX_ATTACH_MB:g}MB limit)")
+            continue
+        outbound.append(p)
+    if errors:
+        reply = (reply + "\n" if reply else "") + "\n".join(errors)
+
+    if status is not None:
+        try:
+            await status.delete()
+        except Exception:
+            pass
+
+    # long replies go out as a .md file instead of a wall of chunks
+    reply_file = None
+    if REPLY_AS_FILE_LIMIT > 0 and len(reply) > REPLY_AS_FILE_LIMIT:
+        try:
+            fd, tmppath = tempfile.mkstemp(
+                prefix="reply-", suffix=".md", dir=str(inbox))
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                f.write(reply)
+            reply_file = tmppath
+            log.info("[%s] reply %d chars -> file %s",
+                     key, len(reply), tmppath)
+            reply = f"reply too long ({len(reply)} chars), attached as file."
+        except Exception:
+            log.exception("[%s] reply-to-file failed, chunking instead", key)
+            reply_file = None
+
+    try:
+        for part in split_smart(reply, MAX_DISCORD):
+            await channel.send(part)
+        if reply_file:
+            try:
+                await channel.send(
+                    file=discord.File(reply_file, filename="reply.md"))
+            finally:
+                try:
+                    os.unlink(reply_file)
+                except OSError:
+                    pass
+        for p in outbound:
+            log.info("[%s] uploading %s (%d bytes)", key, p, p.stat().st_size)
+            try:
+                await channel.send(file=discord.File(str(p)))
+                log.info("[%s] uploaded %s", key, p)
+            except Exception as e:
+                log.exception("[%s] upload failed: %s", key, p)
+                await channel.send(f"(failed to attach {p.name}: {e})")
+    except Exception:
+        log.exception("[%s] reply send failed", key)
+        for m in messages:
+            await swap_react(m, REACT_START, REACT_ERROR)
+        return
+    for m in messages:
+        await swap_react(m, REACT_START, REACT_DONE)
+
+
+async def run_batches(key, channel, q, batch, inbox, status):
+    """Run one turn, then single follow-up turns for coalesced arrivals."""
+    global ACTIVE_TURNS
+    async with ACTIVE_GUARD:
+        ACTIVE_TURNS += 1
+        first = ACTIVE_TURNS == 1
+    if first:
+        await update_presence()
+    try:
+        while True:
+            msgs = [m for m, _, _ in batch]
+            combined = "\n\n---\n\n".join(p for _, p, _ in batch)
+            combined = f"{combined}\n{BRIDGE_NOTE}" if combined else BRIDGE_NOTE
+            files = [f for _, _, fs in batch for f in fs]
+            log.info("[%s] turn: %d msg(s), %d chars + %d files",
+                     key, len(batch), len(combined), len(files))
+            log.debug("[%s] full prompt:\n%s", key, combined[:3000])
+            async with channel.typing():
+                reply, new_sid = await asyncio.to_thread(
+                    run_opencode, combined, key, files)
+            if new_sid and new_sid != SESSIONS.get(key):
+                SESSIONS[key] = new_sid
+                save_state(SESSIONS)
+                log.info("[%s] session: %s", key, new_sid)
+            await deliver_reply(key, channel, msgs, reply, inbox, status)
+            status = None
+            async with q.guard:
+                if not q.buffer:
+                    q.running = False
+                    return
+                batch = q.buffer
+                q.buffer = []
+                log.info("[%s] coalesced follow-up: %d msg(s)",
+                         key, len(batch))
+    finally:
+        async with q.guard:
+            stuck = [m for m, _, _ in q.buffer]
+            q.buffer = []
+            q.running = False
+        for m in stuck:
+            await swap_react(m, REACT_START, REACT_ERROR)
+        async with ACTIVE_GUARD:
+            ACTIVE_TURNS -= 1
+            last = ACTIVE_TURNS == 0
+        if last:
+            await update_presence()
+
+
 @client.event
 async def on_ready():
     log.info("logged in as %s (id %s)", client.user, client.user.id)
+    await update_presence()
 
 
 @client.event
@@ -568,93 +728,20 @@ async def on_message(message):
         prompt = content
         if attach_notes:
             prompt = (prompt + "\n" if prompt else "") + "\n".join(attach_notes)
-        prompt = f"{prompt}\n{BRIDGE_NOTE}" if prompt else BRIDGE_NOTE
 
         log.info("[%s] opencode prompt: %d chars + %d files (--file=%s)",
                  key, len(prompt), len(local_files), local_files)
         log.debug("[%s] prompt attach notes:\n%s", key, "\n".join(attach_notes) or "(none)")
-        log.debug("[%s] full prompt:\n%s", key, prompt[:3000])
-        lock = get_lock(key)
-        if lock.locked():
-            log.info("[%s] turn queued behind active run", key)
-        async with lock:
-            reply, new_sid = await asyncio.to_thread(
-                run_opencode, prompt, key, local_files)
-            if new_sid and new_sid != SESSIONS.get(key):
-                SESSIONS[key] = new_sid
-                save_state(SESSIONS)
-                log.info("[%s] session: %s", key, new_sid)
-
-    # --- outbound attachments: [[attach:path]] -> discord.File ---
-    reply, out_paths = split_attach_markers(reply)
-    log.info("[%s] reply: %d chars, %d attach marker(s): %s",
-             key, len(reply), len(out_paths), out_paths)
-    errors = []
-    outbound = []
-    for pstr in out_paths:
-        p = resolve_outbound(pstr)
-        log.info("[%s] outbound: %r -> %s", key, pstr, p)
-        if not p.is_file():
-            log.warning("[%s] outbound missing: %s", key, p)
-            errors.append(f"(could not attach {pstr}: file not found)")
-            continue
-        if p.stat().st_size > MAX_ATTACH_MB * 1024 * 1024:
-            log.warning("[%s] outbound too big: %s %d bytes",
-                        key, p, p.stat().st_size)
-            errors.append(
-                f"(could not attach {p.name}: exceeds {MAX_ATTACH_MB:g}MB limit)")
-            continue
-        outbound.append(p)
-    if errors:
-        reply = (reply + "\n" if reply else "") + "\n".join(errors)
-
-    if status is not None:
-        try:
-            await status.delete()
-        except Exception:
-            pass
-
-    # long replies go out as a .md file instead of a wall of chunks
-    reply_file = None
-    if REPLY_AS_FILE_LIMIT > 0 and len(reply) > REPLY_AS_FILE_LIMIT:
-        try:
-            fd, tmppath = tempfile.mkstemp(
-                prefix="reply-", suffix=".md", dir=str(inbox))
-            with os.fdopen(fd, "w", encoding="utf-8") as f:
-                f.write(reply)
-            reply_file = tmppath
-            log.info("[%s] reply %d chars -> file %s",
-                     key, len(reply), tmppath)
-            reply = f"reply too long ({len(reply)} chars), attached as file."
-        except Exception:
-            log.exception("[%s] reply-to-file failed, chunking instead", key)
-            reply_file = None
-
-    try:
-        for part in split_smart(reply, MAX_DISCORD):
-            await message.channel.send(part)
-        if reply_file:
-            try:
-                await message.channel.send(
-                    file=discord.File(reply_file, filename="reply.md"))
-            finally:
-                try:
-                    os.unlink(reply_file)
-                except OSError:
-                    pass
-        for p in outbound:
-            log.info("[%s] uploading %s (%d bytes)", key, p, p.stat().st_size)
-            try:
-                await message.channel.send(file=discord.File(str(p)))
-                log.info("[%s] uploaded %s", key, p)
-            except Exception as e:
-                log.exception("[%s] upload failed: %s", key, p)
-                await message.channel.send(f"(failed to attach {p.name}: {e})")
-    except Exception:
-        log.exception("[%s] reply send failed", key)
-        await swap_react(message, REACT_START, REACT_ERROR)
-        raise
-    await swap_react(message, REACT_START, REACT_DONE)
+        q = get_queue(key)
+        async with q.guard:
+            if q.running:
+                q.buffer.append((message, prompt, local_files))
+                log.info("[%s] coalesced into running turn (%d pending)",
+                         key, len(q.buffer))
+                return
+            q.running = True
+        await run_batches(key, message.channel, q,
+                          [(message, prompt, local_files)], inbox, status)
 
 
 if __name__ == "__main__":
