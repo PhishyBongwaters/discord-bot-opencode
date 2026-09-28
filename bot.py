@@ -4,6 +4,11 @@
 - DMs the bot -> forwarded to `opencode run`; the reply comes back to the DM.
 - In guilds: reacts to @mentions or `!oc` prefix (per-channel sessions).
 - `!new` resets your session, `!help` shows help.
+- Direct file drops ("place this in <dir>" + attachments) move files
+  without involving opencode, so model content moderation never applies.
+- Direct sends ("send me <path>") upload without involving opencode.
+- Other attachments go to opencode via --file (text/code/images incl.
+  gif) or path-only (video); `[[attach:path]]` markers come back as files.
 - No Hermes, no gateway besides this bot. discord-send (sibling script)
   covers the other direction for one-shot sends from shell/opencode.
 

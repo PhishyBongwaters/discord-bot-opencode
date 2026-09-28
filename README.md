@@ -55,17 +55,19 @@ Two-way chat between Discord and opencode. DM the bot, it forwards to `opencode 
 
 ## Attachments
 
-**Inbound (Discord -> opencode):** files save to `attachments/<dm_or_channel>/` and the local path is added to the prompt. Text/code/images are also passed with `opencode run --file`. Video (`mp4/mov/mkv/avi/webm/m4v/mpg/mpeg/wmv/flv/gif`, any `video/*`) is **path-only** — never inlined, the model uses shell/file tools on the saved path.
+**Direct drop (no model involved):** attach file(s) with `place / put / save / drop / move / copy this in(to) <dir>` (e.g. `Place this in d:/projects`). The bot saves to `attachments/<dm_or_channel>/`, creates the target dir, moves the files, and confirms. opencode is never called, so filename/content moderation can't refuse.
 
-Example: send `clip.mp4` with `drop this in d:\files` — the model gets `[Attached video: clip.mp4 (...) saved at D:\...\attachments\...\clip.mp4 - NOT inlined, use shell/file tools on this path]`.
+**Direct send (no model involved):** `send me D:\files\clip.mp4` (or `send <path>`) with no attachments uploads that path straight via `discord.File`. If the text isn't an existing file path, it falls through to opencode as normal chat.
 
-**Outbound (opencode -> Discord):** ask for a file by path (`send me D:\files\clip.mp4`). The model emits `[[attach:D:\files\clip.mp4]]` on its own line; the bot strips the marker and uploads via `discord.File`. Missing/oversize files come back as text errors, not silent fails.
+**Via opencode:** files save to `attachments/<dm_or_channel>/` and the local path is added to the prompt. Text/code/images (incl. gif) are also passed with `opencode run --file`. True video (`mp4/mov/mkv/avi/webm/m4v/mpg/mpeg/wmv/flv`, any `video/*`) is **path-only** — never inlined, the model uses shell/file tools on the saved path.
 
-Requires `OPENCODE_AUTO=1` (or an agent that can approve file tools) for actual moves/writes.
+**Outbound via opencode:** the model emits `[[attach:D:\files\clip.mp4]]` on its own line; the bot strips the marker and uploads. Missing/oversize files come back as text errors, not silent fails.
+
+Model-driven moves/writes require `OPENCODE_AUTO=1` (or an agent that can approve file tools).
 
 ## discord-send.py
 
-One-shot REST sender, stdlib-only:
+One-shot REST sender, stdlib-only (tested: channel + DM delivery work):
 
 ```
 python discord-send.py --to '#ops' "deploy finished"
@@ -75,12 +77,12 @@ python discord-send.py --to '#ops' --subject "Nightly" --file out.txt
 python discord-send.py --list
 ```
 
-Targets: `#name`, `<channel_id>`, `channel:<id>`, `dm:<user_id>`, `user:<id>`, `@<id>`, or `DEFAULT_DISCORD_CHANNEL` env. Exit codes: 0 ok, 1 delivery failure, 2 usage error.
+With `DEFAULT_DISCORD_CHANNEL` set in `.env`, omit `--to`. Targets: `#name`, `<channel_id>`, `channel:<id>`, `dm:<user_id>`, `user:<id>`, `@<id>`. Exit codes: 0 ok, 1 delivery failure, 2 usage error.
 
 ## Troubleshooting
 
 - **"application did not respond"**: you used `/new`. Send `!new` as a plain message instead.
+- **"unable to help" / content refusal on file moves**: use the direct drop form (attach + `Place this in d:/projects`) — it bypasses the model entirely. Same for sends: `send me D:\files\clip.mp4` uploads without asking the model.
 - **"I don't see any file" / stuck refusal**: the opencode session predates the fix or a failed turn. Send `!new`, then resend the file fresh. Session continuity (`--session`) keeps old context otherwise.
-- **"unable to help" on file moves**: set `OPENCODE_AUTO=1` and restart. Without `--auto`, non-interactive runs can't approve writes.
 - **`mkgy2(1)(2)(3).gif`**: same filename re-sent repeatedly; the inbox dedups instead of overwriting. Safe to delete `attachments/` contents.
 - **No reply at all**: check stderr logs (`[dm:...]` / `[guild:...]` lines), verify Message Content intent is on, and that your user id is in `ALLOWED_USER_IDS`.
