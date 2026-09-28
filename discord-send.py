@@ -4,6 +4,8 @@
 Drop-in replacement for `hermes send --to discord ...` with no Hermes
 dependency and no running gateway. Talks directly to the Discord REST API
 using a bot token, exactly like `hermes send` does for bot-token platforms.
+Requires chunking.py (sibling, also stdlib-only) alongside this file for
+fence-aware message splitting.
 
 Usage:
     discord-send --to '#ops' "deploy finished"
@@ -32,6 +34,8 @@ import os
 import sys
 import urllib.request
 import urllib.error
+
+from chunking import split_smart
 
 API = "https://discord.com/api/v10"
 MAX_LEN = 2000
@@ -131,15 +135,9 @@ def ensure_dm_channel(token, user_id):
     return data["id"]
 
 
-def chunk(text, n=MAX_LEN):
-    while text:
-        yield text[:n]
-        text = text[n:]
-
-
 def send_chunks(token, channel_id, text):
     sent = 0
-    for part in chunk(text):
+    for part in split_smart(text, MAX_LEN):
         status, data = api(token, "POST", f"/channels/{channel_id}/messages",
                            {"content": part})
         if status not in (200, 201):

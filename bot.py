@@ -28,6 +28,7 @@ Config via env (or .env in cwd / ~/.config/opencode-discord/):
     ATTACH_DIR          default ./attachments (inbound inbox)
     MAX_ATTACH_MB       default 25 (in/out file size cap)
     LOG_LEVEL           default INFO (e.g. DEBUG for verbose)
+    REPLY_AS_FILE_LIMIT default 4000 (longer replies sent as reply.md; 0 disables)
     REACT_START/DONE/ERROR  default hourglass/check/cross (empty disables)
 
 Required Discord privileged intent: Message Content (toggle in the
@@ -42,8 +43,11 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
 import time
 from pathlib import Path
+
+from chunking import split_smart
 
 try:
     import discord
@@ -89,6 +93,7 @@ GUILD_PREFIX = os.environ.get("GUILD_PREFIX", "!oc")
 ATTACH_DIR = Path(os.environ.get("ATTACH_DIR", "attachments"))
 MAX_ATTACH_MB = float(os.environ.get("MAX_ATTACH_MB", "25"))
 LOG_LEVEL = os.environ.get("LOG_LEVEL", "INFO").upper()
+REPLY_AS_FILE_LIMIT = int(os.environ.get("REPLY_AS_FILE_LIMIT", "4000"))
 REACT_START = os.environ.get("REACT_START", "\u23f3")
 REACT_DONE = os.environ.get("REACT_DONE", "\u2705")
 REACT_ERROR = os.environ.get("REACT_ERROR", "\u274c")
@@ -352,17 +357,6 @@ def resolve_outbound(path_str):
     return p
 
 
-def chunk(text, n=MAX_DISCORD):
-    # prefer splitting on newlines near the boundary
-    while len(text) > n:
-        cut = text.rfind("\n", 0, n)
-        cut = cut if cut > n // 2 else n
-        yield text[:cut]
-        text = text[cut:].lstrip("\n")
-    if text:
-        yield text
-
-
 intents = discord.Intents.default()
 intents.message_content = True
 intents.dm_messages = True
@@ -620,9 +614,34 @@ async def on_message(message):
         except Exception:
             pass
 
+    # long replies go out as a .md file instead of a wall of chunks
+    reply_file = None
+    if REPLY_AS_FILE_LIMIT > 0 and len(reply) > REPLY_AS_FILE_LIMIT:
+        try:
+            fd, tmppath = tempfile.mkstemp(
+                prefix="reply-", suffix=".md", dir=str(inbox))
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                f.write(reply)
+            reply_file = tmppath
+            log.info("[%s] reply %d chars -> file %s",
+                     key, len(reply), tmppath)
+            reply = f"reply too long ({len(reply)} chars), attached as file."
+        except Exception:
+            log.exception("[%s] reply-to-file failed, chunking instead", key)
+            reply_file = None
+
     try:
-        for part in chunk(reply):
+        for part in split_smart(reply, MAX_DISCORD):
             await message.channel.send(part)
+        if reply_file:
+            try:
+                await message.channel.send(
+                    file=discord.File(reply_file, filename="reply.md"))
+            finally:
+                try:
+                    os.unlink(reply_file)
+                except OSError:
+                    pass
         for p in outbound:
             log.info("[%s] uploading %s (%d bytes)", key, p, p.stat().st_size)
             try:

@@ -8,6 +8,7 @@ Two-way chat between Discord and opencode. DM the bot, it forwards to `opencode 
 - `!help`: usage
 - Reactions: hourglass while working, check when done, cross on failure
 - Per-session turn queue (rapid messages run in order, not concurrently)
+- Fence-aware chunking (`chunking.py`, shared with the sender) + long replies sent as `reply.md`
 - Attachments in both directions (direct drop/send bypass the model)
 - `discord-send.py`: one-shot sender for shell/opencode (REST only, no gateway)
 
@@ -53,6 +54,7 @@ Two-way chat between Discord and opencode. DM the bot, it forwards to `opencode 
 | `ATTACH_DIR` | `attachments` | Inbound inbox root (`<dir>/<session_key>/`) |
 | `MAX_ATTACH_MB` | `25` | In/out file size cap |
 | `LOG_LEVEL` | `INFO` | `DEBUG` dumps full opencode stdout/stderr |
+| `REPLY_AS_FILE_LIMIT` | `4000` | Replies longer than this go out as `reply.md`; `0` disables |
 | `REACT_START` / `REACT_DONE` / `REACT_ERROR` | hourglass / check / cross | Working/done/error reactions; empty disables |
 
 `sample.env` shows the same knobs.
