@@ -208,30 +208,36 @@ if not ALLOWED:
 
 
 def load_state():
-    """State shape: {"active": {key: sid}, "known": {key: [sid, ...]}}."""
+    """State shape: {"active": {...}, "known": {...}, "models": {...}}."""
     try:
         raw = json.loads(STATE_FILE.read_text())
     except (OSError, json.JSONDecodeError):
-        return {"active": {}, "known": {}}
+        return {"active": {}, "known": {}, "models": {}}
     if isinstance(raw, dict) and isinstance(raw.get("active"), dict):
         known = raw.get("known")
+        models = raw.get("models")
         return {"active": raw["active"],
-                "known": known if isinstance(known, dict) else {}}
+                "known": known if isinstance(known, dict) else {},
+                "models": models if isinstance(models, dict) else {}}
     # legacy flat {key: sid}
     act = ({k: v for k, v in raw.items() if isinstance(v, str)}
            if isinstance(raw, dict) else {})
-    return {"active": act, "known": {k: [v] for k, v in act.items()}}
+    return {"active": act,
+            "known": {k: [v] for k, v in act.items()},
+            "models": {}}
 
 
 def save_state():
     STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
-    STATE_FILE.write_text(json.dumps({"active": SESSIONS, "known": KNOWN},
-                                     indent=2))
+    STATE_FILE.write_text(json.dumps(
+        {"active": SESSIONS, "known": KNOWN, "models": MODEL_OVERRIDES},
+        indent=2))
 
 
 _STATE = load_state()
 SESSIONS = _STATE["active"]  # key -> opencode session id
 KNOWN = _STATE["known"]  # key -> [opencode session ids the bot has used]
+MODEL_OVERRIDES = _STATE["models"]  # key -> "provider/model"
 
 
 def remember_session(key, sid):
@@ -407,14 +413,15 @@ def strip_json_events(ndjson_text):
         log.debug("opencode event types: %s", sorted(seen_types))
     return "".join(parts).strip()
 
-def run_opencode(prompt, session_key, files=None):
+def run_opencode(prompt, session_key, files=None, model=None):
     """Run one opencode turn. Returns (reply_text, session_id_or_None)."""
     cmd = [OPENCODE_BIN, "run", "--format", "json"]
     session_id = SESSIONS.get(session_key)
     if session_id:
         cmd += ["--session", session_id]
-    if OPENCODE_MODEL:
-        cmd += ["-m", OPENCODE_MODEL]
+    m = model or OPENCODE_MODEL
+    if m:
+        cmd += ["-m", m]
     if OPENCODE_AGENT:
         cmd += ["--agent", OPENCODE_AGENT]
     if OPENCODE_AUTO:
@@ -687,12 +694,14 @@ async def run_batches(key, channel, q, batch, inbox, status):
             combined = "\n\n---\n\n".join(p for _, p, _ in batch)
             combined = f"{combined}\n{BRIDGE_NOTE}" if combined else BRIDGE_NOTE
             files = [f for _, _, fs in batch for f in fs]
-            log.info("[%s] turn: %d msg(s), %d chars + %d files",
-                     key, len(batch), len(combined), len(files))
+            log.info("[%s] turn: %d msg(s), %d chars + %d files, model=%s",
+                     key, len(batch), len(combined), len(files),
+                     MODEL_OVERRIDES.get(key) or OPENCODE_MODEL or "(default)")
             log.debug("[%s] full prompt:\n%s", key, combined[:3000])
             async with channel.typing():
                 reply, new_sid = await asyncio.to_thread(
-                    run_opencode, combined, key, files)
+                    run_opencode, combined, key, files,
+                    MODEL_OVERRIDES.get(key))
             if new_sid and new_sid != SESSIONS.get(key):
                 SESSIONS[key] = new_sid
                 remember_session(key, new_sid)
@@ -767,6 +776,92 @@ def build_session_options(entries, key, max_options=24):
     return opts
 
 
+def key_for_interaction(interaction):
+    ch = interaction.channel
+    if ch is None or isinstance(ch, discord.DMChannel):
+        return f"dm:{interaction.user.id}"
+    return f"guild:{interaction.channel_id}"
+
+
+MODELS_CACHE = {"at": 0.0, "items": []}
+MODELS_TTL = 3600
+
+
+def list_models():
+    """Live `opencode models` (provider/model lines). None on failure."""
+    try:
+        proc = subprocess.run(
+            [OPENCODE_BIN, "models"],
+            cwd=OPENCODE_DIR, capture_output=True, text=True,
+            encoding="utf-8", errors="replace", timeout=30)
+    except (subprocess.TimeoutExpired, FileNotFoundError, OSError) as e:
+        log.warning("model list failed: %s", e)
+        return None
+    if proc.returncode != 0:
+        log.warning("model list rc=%d: %s", proc.returncode,
+                    (proc.stderr or "")[:500])
+        return None
+    items = [ln.strip() for ln in (proc.stdout or "").splitlines()
+             if "/" in ln.strip() and " " not in ln.strip()]
+    return items or None
+
+
+def get_models():
+    now = time.monotonic()
+    if not MODELS_CACHE["items"] or now - MODELS_CACHE["at"] > MODELS_TTL:
+        items = list_models()
+        if items:
+            MODELS_CACHE.update(at=now, items=items)
+    return MODELS_CACHE["items"]
+
+
+async def model_autocomplete(interaction: discord.Interaction, current: str):
+    items = await asyncio.to_thread(get_models)
+    cur = (current or "").lower()
+    out = []
+    if not cur or "default".startswith(cur):
+        out.append(app_commands.Choice(
+            name="Default (env / opencode default)", value="__clear__"))
+    for it in items:
+        if cur in it.lower():
+            prov, name = it.split("/", 1)
+            out.append(app_commands.Choice(
+                name=f"{name} ({prov})"[:100], value=it))
+        if len(out) >= 25:
+            break
+    return out
+
+
+@tree.command(name="model",
+              description="View or switch the opencode model for this chat")
+@app_commands.describe(model="provider/model, or Default to clear")
+@app_commands.autocomplete(model=model_autocomplete)
+async def model_cmd(interaction: discord.Interaction, model: str):
+    if ALLOWED and str(interaction.user.id) not in ALLOWED:
+        await interaction.response.send_message(
+            "not allowed.", ephemeral=True)
+        return
+    key = key_for_interaction(interaction)
+    if not model or model.strip() == "__clear__":
+        MODEL_OVERRIDES.pop(key, None)
+        save_state()
+        log.info("[%s] model override cleared", key)
+        await interaction.response.send_message(
+            "model cleared - back to default.", ephemeral=True)
+        return
+    items = await asyncio.to_thread(get_models)
+    if items and model not in items:
+        await interaction.response.send_message(
+            "unknown model - pick one from the autocomplete list.",
+            ephemeral=True)
+        return
+    MODEL_OVERRIDES[key] = model
+    save_state()
+    log.info("[%s] model override: %s", key, model)
+    await interaction.response.send_message(
+        f"model for this chat: `{model}`.", ephemeral=True)
+
+
 class SessionPicker(discord.ui.View):
     def __init__(self, key, options, titles, timeout=120):
         super().__init__(timeout=timeout)
@@ -810,13 +905,7 @@ async def sessions_cmd(interaction: discord.Interaction):
         await interaction.response.send_message(
             "not allowed.", ephemeral=True)
         return
-    ch = interaction.channel
-    if ch is None:
-        key = f"dm:{interaction.user.id}"
-    elif isinstance(ch, discord.DMChannel):
-        key = f"dm:{interaction.user.id}"
-    else:
-        key = f"guild:{interaction.channel_id}"
+    key = key_for_interaction(interaction)
     await interaction.response.defer(ephemeral=True)
     entries = await asyncio.to_thread(list_sessions)
     if entries is None:
@@ -896,7 +985,8 @@ async def on_message(message):
             "Attach + `place this in <dir>` saves files directly.\n"
             "`send me <path>` sends a file back directly.\n"
             "Rapid messages merge into one follow-up - wait for the check.\n"
-            "`/sessions` - browse and switch opencode sessions (servers)."
+            "`/sessions` - browse and switch opencode sessions (servers).\n"
+            "`/model` - switch the model for this chat."
             + extra)
         return
 
@@ -926,8 +1016,12 @@ async def on_message(message):
         q = get_queue(key)
         queue_s = (f"running + {len(q.buffer)} pending" if q.running
                    else "idle")
+        model = MODEL_OVERRIDES.get(key)
+        model_s = model if model else (
+            f"{OPENCODE_MODEL} (env)" if OPENCODE_MODEL else "opencode default")
         await message.channel.send(
             f"session `{sid}`\n"
+            f"model: `{model_s}`\n"
             f"turns: {u['turns']} | tokens: {u['in']} in / {u['out']} out | "
             f"cost: ${u['cost']:.4f}\n"
             f"inbox: {inbox_s}\n"

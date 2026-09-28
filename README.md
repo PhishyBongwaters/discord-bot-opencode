@@ -5,8 +5,9 @@ Two-way chat between Discord and opencode. DM the bot, it forwards to `opencode 
 - DMs: any message goes to opencode (per-user session)
 - Servers: `@bot` mention or `!oc <prompt>` (per-channel session)
 - `!new`: start a fresh opencode session (plain message with `!`, **not** `/new` — there are no slash commands)
-- `!status`: session id, turns, tokens, cost, inbox, queue state
+- `!status`: session id, model, turns, tokens, cost, inbox, queue state
 - `/sessions`: dropdown browser to switch opencode sessions (servers; DMs after global sync)
+- `/model`: autocomplete to switch the model for this chat
 - `!help`: usage
 - Reactions: hourglass while working, check when done, cross on failure
 - Dynamic presence: Listening when idle, DND "working..." while any turn runs
@@ -87,6 +88,8 @@ Model-driven moves/writes require `OPENCODE_AUTO=1` (or an agent that can approv
 ## Slash commands
 
 `/sessions` shows a dropdown of the bot project's opencode sessions (newest first, via `opencode session list`). Each entry is tagged `[bot]` (the bot has used it in this chat) or `[cli]` (terminal/other), with the active session starred. Pick one to switch this chat to it, or `+ New session` for a fresh start. Everything is ephemeral (only you see it).
+
+`/model` switches the model for this chat with autocomplete over `opencode models` (`provider/model`, 50+ entries — hence search, not a dropdown). Pick `Default` to clear back to `OPENCODE_MODEL`/opencode default. Overrides persist per chat and show in `!status`.
 
 Notes: per-guild sync is instant on startup; global sync (which covers DMs) can take up to an hour to propagate. Session listing is project-scoped to `OPENCODE_DIR` — terminal sessions in other directories won't appear.
 
