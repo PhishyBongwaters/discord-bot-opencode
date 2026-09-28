@@ -167,8 +167,10 @@ BRIDGE_NOTE = (
     "are only saved locally, use shell/file tools on the saved path. "
     "To send a file back to the user, put [[attach:FULL_PATH]] on its own "
     "line, e.g. [[attach:D:\\files\\clip.mp4]]. Use absolute paths. "
-    "To react to the user's message, put [[react:EMOJI]] on its own line "
-    "with a literal emoji, e.g. [[react:👍]] (custom <:name:id> also works, "
+    "To react to the user's message, put [[react:EMOJI]] on its own "
+    "line. React with personality - match the vibe of the message "
+    "(funny gets 😂, juicy gets 👀, cursed gets 🫠, yikes gets 😅). "
+    "Use a literal emoji, e.g. [[react:👀]] (custom <:name:id> also works, "
     "shortcodes like :+1: do NOT). Max 5 per turn. "
     "Only attach/react for files the user asked for or you created for them.]"
 )
