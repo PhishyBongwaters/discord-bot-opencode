@@ -6,7 +6,9 @@ Two-way chat between Discord and opencode. DM the bot, it forwards to `opencode 
 - Servers: `@bot` mention or `!oc <prompt>` (per-channel session)
 - `!new`: start a fresh opencode session (plain message with `!`, **not** `/new` — there are no slash commands)
 - `!help`: usage
-- Attachments in both directions
+- Reactions: hourglass while working, check when done, cross on failure
+- Per-session turn queue (rapid messages run in order, not concurrently)
+- Attachments in both directions (direct drop/send bypass the model)
 - `discord-send.py`: one-shot sender for shell/opencode (REST only, no gateway)
 
 ## Setup
@@ -23,6 +25,7 @@ Two-way chat between Discord and opencode. DM the bot, it forwards to `opencode 
    ```
    DISCORD_BOT_TOKEN=...
    ALLOWED_USER_IDS=243337216758120448
+   DEFAULT_DISCORD_CHANNEL=1513943523894759606
    OPENCODE_BIN=C:\Users\macdo\AppData\Roaming\npm\opencode.cmd
    OPENCODE_DIR=D:\Projects\discord-bot
    OPENCODE_AUTO=1
@@ -50,6 +53,7 @@ Two-way chat between Discord and opencode. DM the bot, it forwards to `opencode 
 | `ATTACH_DIR` | `attachments` | Inbound inbox root (`<dir>/<session_key>/`) |
 | `MAX_ATTACH_MB` | `25` | In/out file size cap |
 | `LOG_LEVEL` | `INFO` | `DEBUG` dumps full opencode stdout/stderr |
+| `REACT_START` / `REACT_DONE` / `REACT_ERROR` | hourglass / check / cross | Working/done/error reactions; empty disables |
 
 `sample.env` shows the same knobs.
 
@@ -85,4 +89,4 @@ With `DEFAULT_DISCORD_CHANNEL` set in `.env`, omit `--to`. Targets: `#name`, `<c
 - **"unable to help" / content refusal on file moves**: use the direct drop form (attach + `Place this in d:/projects`) — it bypasses the model entirely. Same for sends: `send me D:\files\clip.mp4` uploads without asking the model.
 - **"I don't see any file" / stuck refusal**: the opencode session predates the fix or a failed turn. Send `!new`, then resend the file fresh. Session continuity (`--session`) keeps old context otherwise.
 - **`mkgy2(1)(2)(3).gif`**: same filename re-sent repeatedly; the inbox dedups instead of overwriting. Safe to delete `attachments/` contents.
-- **No reply at all**: check stderr logs (`[dm:...]` / `[guild:...]` lines), verify Message Content intent is on, and that your user id is in `ALLOWED_USER_IDS`.
+- **No reply at all**: check stderr logs (`[dm:...]` / `[guild:...]` lines), verify Message Content intent is on, and that your user id is in `ALLOWED_USER_IDS` (anyone else is silently ignored).
