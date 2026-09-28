@@ -456,8 +456,11 @@ async def deliver_reply(key, channel, messages, reply, inbox, status):
         p = resolve_outbound(pstr)
         log.info("[%s] outbound: %r -> %s", key, pstr, p)
         if not p.is_file():
-            log.warning("[%s] outbound missing: %s", key, p)
-            errors.append(f"(could not attach {pstr}: file not found)")
+            # Silent skip, not a user error: doc examples ([[attach:path]],
+            # [[attach:FULL_PATH]]) echo back whenever the model quotes
+            # instructions or source, and must never spam the channel.
+            log.info("[%s] outbound marker has no such file, skipping: %s",
+                     key, p)
             continue
         if p.stat().st_size > MAX_ATTACH_MB * 1024 * 1024:
             log.warning("[%s] outbound too big: %s %d bytes",
