@@ -30,6 +30,8 @@ Config via env (or .env in cwd / ~/.config/opencode-discord/):
     GUILD_PREFIX        default "!oc"
     ATTACH_DIR          default ./attachments (inbound inbox)
     MAX_ATTACH_MB       default 25 (in/out file size cap)
+    ATTACH_KEEP_FILES   default 50 (inbox prune: newest N kept, 0 = unlimited)
+    ATTACH_KEEP_MB      default 500 (inbox prune: total MB cap, 0 = unlimited)
     LOG_LEVEL           default INFO (e.g. DEBUG for verbose)
     REPLY_AS_FILE_LIMIT default 4000 (longer replies sent as reply.md; 0 disables)
     REACT_START/DONE/ERROR  default hourglass/check/cross (empty disables)
@@ -82,6 +84,25 @@ def load_dotenv():
 
 load_dotenv()
 
+
+def _env_int(name, default):
+    try:
+        return int(os.environ.get(name, str(default)))
+    except ValueError:
+        print(f"WARNING: {name} invalid ({os.environ.get(name)!r}) - "
+              f"using {default}", file=sys.stderr)
+        return default
+
+
+def _env_float(name, default):
+    try:
+        return float(os.environ.get(name, str(default)))
+    except ValueError:
+        print(f"WARNING: {name} invalid ({os.environ.get(name)!r}) - "
+              f"using {default}", file=sys.stderr)
+        return default
+
+
 TOKEN = os.environ.get("DISCORD_BOT_TOKEN", "").strip()
 ALLOWED = {u.strip() for u in os.environ.get("ALLOWED_USER_IDS", "").split(",")
            if u.strip()}
@@ -90,13 +111,15 @@ OPENCODE_DIR = os.environ.get("OPENCODE_DIR", os.getcwd())
 OPENCODE_MODEL = os.environ.get("OPENCODE_MODEL", "").strip()
 OPENCODE_AGENT = os.environ.get("OPENCODE_AGENT", "").strip()
 OPENCODE_AUTO = os.environ.get("OPENCODE_AUTO", "0") == "1"
-OPENCODE_TIMEOUT = int(os.environ.get("OPENCODE_TIMEOUT", "600"))
+OPENCODE_TIMEOUT = _env_int("OPENCODE_TIMEOUT", 600)
 STATE_FILE = Path(os.environ.get("STATE_FILE", "state/sessions.json"))
 GUILD_PREFIX = os.environ.get("GUILD_PREFIX", "!oc")
 ATTACH_DIR = Path(os.environ.get("ATTACH_DIR", "attachments"))
-MAX_ATTACH_MB = float(os.environ.get("MAX_ATTACH_MB", "25"))
+MAX_ATTACH_MB = _env_float("MAX_ATTACH_MB", 25)
+ATTACH_KEEP_FILES = _env_int("ATTACH_KEEP_FILES", 50)
+ATTACH_KEEP_MB = _env_float("ATTACH_KEEP_MB", 500)
 LOG_LEVEL = os.environ.get("LOG_LEVEL", "INFO").upper()
-REPLY_AS_FILE_LIMIT = int(os.environ.get("REPLY_AS_FILE_LIMIT", "4000"))
+REPLY_AS_FILE_LIMIT = _env_int("REPLY_AS_FILE_LIMIT", 4000)
 REACT_START = os.environ.get("REACT_START", "\u23f3")
 REACT_DONE = os.environ.get("REACT_DONE", "\u2705")
 REACT_ERROR = os.environ.get("REACT_ERROR", "\u274c")
@@ -384,6 +407,40 @@ def safe_key(key):
     return re.sub(r"[^A-Za-z0-9_-]+", "_", key)
 
 
+def prune_inbox(inbox, key="?"):
+    """Drop oldest inbox files beyond count/byte caps (reply leftovers too)."""
+    try:
+        files = sorted(
+            (p for p in inbox.iterdir() if p.is_file()),
+            key=lambda p: p.stat().st_mtime)
+    except OSError:
+        return
+    pruned = 0
+    if ATTACH_KEEP_FILES > 0:
+        while len(files) > ATTACH_KEEP_FILES:
+            old = files.pop(0)
+            try:
+                old.unlink()
+                pruned += 1
+            except OSError:
+                pass
+    if ATTACH_KEEP_MB > 0:
+        try:
+            total = sum(p.stat().st_size for p in files)
+        except OSError:
+            total = 0
+        while files and total > ATTACH_KEEP_MB * 1024 * 1024:
+            old = files.pop(0)
+            try:
+                total -= old.stat().st_size
+                old.unlink()
+                pruned += 1
+            except OSError:
+                pass
+    if pruned:
+        log.info("[%s] pruned %d old inbox file(s)", key, pruned)
+
+
 def split_attach_markers(reply):
     """Strip [[attach:path]] markers. Returns (clean_text, [paths])."""
     paths = [m.group(1).strip().strip("'\"") for m in ATTACH_RE.finditer(reply)]
@@ -607,20 +664,26 @@ async def on_message(message):
         return
 
     if content.lower() in ("!help", "help"):
+        extra = (f"\n(psst: you attached {len(message.attachments)} file(s) - "
+                 "resend them with your actual message.)"
+                 if message.attachments else "")
         await message.channel.send(
             "DM me anything and I'll run it through opencode.\n"
             "`!new` - fresh session (plain message, not /new)\n"
             f"`{GUILD_PREFIX} <prompt>` - use me in a server channel\n"
             "Attach + `place this in <dir>` saves files directly.\n"
             "`send me <path>` sends a file back directly.\n"
-            "Rapid messages merge into one follow-up - wait for the check.")
+            "Rapid messages merge into one follow-up - wait for the check."
+            + extra)
         return
 
     key = session_key_for(message)
     if content.lower() == "!new":
         SESSIONS.pop(key, None)
         save_state(SESSIONS)
-        await message.channel.send("fresh opencode session started.")
+        extra = (f" ({len(message.attachments)} attached file(s) ignored - "
+                 "resend them now.)" if message.attachments else "")
+        await message.channel.send("fresh opencode session started." + extra)
         return
 
     log.info("[%s] msg from %s (%d attach, %d chars): %r",
@@ -701,6 +764,8 @@ async def on_message(message):
                 log.exception("[%s] save failed: %s", key, att.filename)
                 attach_notes.append(
                     f"[Attachment failed: {att.filename}: {e}]")
+
+        prune_inbox(inbox, key)
 
         if status is not None:
             try:

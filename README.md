@@ -54,6 +54,8 @@ Two-way chat between Discord and opencode. DM the bot, it forwards to `opencode 
 | `GUILD_PREFIX` | `!oc` | Server-channel prefix |
 | `ATTACH_DIR` | `attachments` | Inbound inbox root (`<dir>/<session_key>/`) |
 | `MAX_ATTACH_MB` | `25` | In/out file size cap |
+| `ATTACH_KEEP_FILES` | `50` | Inbox prune: keep newest N files (`0` = unlimited) |
+| `ATTACH_KEEP_MB` | `500` | Inbox prune: total MB cap (`0` = unlimited) |
 | `LOG_LEVEL` | `INFO` | `DEBUG` dumps full opencode stdout/stderr |
 | `REPLY_AS_FILE_LIMIT` | `4000` | Replies longer than this go out as `reply.md`; `0` disables |
 | `REACT_START` / `REACT_DONE` / `REACT_ERROR` | hourglass / check / cross | Working/done/error reactions; empty disables |

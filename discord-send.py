@@ -90,6 +90,9 @@ def api(token, method, path, payload=None):
                 time.sleep(wait)
                 continue
             return e.code, {"_error": body}
+        except urllib.error.URLError as e:
+            reason = getattr(e, "reason", None) or e
+            die_delivery(f"{method} {path}: connection failed ({reason})")
 
 
 def die_usage(msg):
