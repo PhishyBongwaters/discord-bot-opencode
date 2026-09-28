@@ -5,6 +5,7 @@ Two-way chat between Discord and opencode. DM the bot, it forwards to `opencode 
 - DMs: any message goes to opencode (per-user session)
 - Servers: `@bot` mention or `!oc <prompt>` (per-channel session)
 - `!new`: start a fresh opencode session (plain message with `!`, **not** `/new` — there are no slash commands)
+- `!status`: session id, turns, tokens, cost, inbox, queue state
 - `!help`: usage
 - Reactions: hourglass while working, check when done, cross on failure
 - Dynamic presence: Listening when idle, DND "working..." while any turn runs
@@ -67,7 +68,8 @@ Two-way chat between Discord and opencode. DM the bot, it forwards to `opencode 
 - **Reacts:** hourglass on your message means it's accepted and working; check means done; cross means something failed (details in console).
 - **Coalescing:** if you send more messages while a turn is running, they merge into a single follow-up turn (separated by `---`) instead of one run each. The follow-up reply covers everything merged. To force separate turns, wait for the check react first.
 - **Presence:** Listening while idle, DND "working..." while any turn runs.
-- **Guild sessions are shared:** everyone talking to the bot in one channel shares that channel's opencode session.
+- **Usage:** per-turn tokens/cost logged; `!status` shows session totals (in-memory, resets on restart).
+- **Guild sessions are shared:** everyone talking to the bot in one channel shares that channel's opencode session. Replies thread under your message.
 
 ## Attachments
 

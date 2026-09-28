@@ -218,6 +218,32 @@ def save_state(state):
 
 
 SESSIONS = load_state()  # key -> opencode session id
+USAGE = {}  # key -> {"in": int, "out": int, "cost": float, "turns": int}
+
+
+def extract_usage(ndjson_text):
+    """Sum tokens/cost across step-finish events. Returns (in, out, cost)."""
+    tin = tout = 0
+    cost = 0.0
+    for line in ndjson_text.splitlines():
+        line = line.strip()
+        if not line.startswith("{"):
+            continue
+        try:
+            obj = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        part = obj.get("part") if isinstance(obj, dict) else None
+        if not isinstance(part, dict) or part.get("type") != "step-finish":
+            continue
+        tok = part.get("tokens") or {}
+        try:
+            tin += int(tok.get("input", 0) or 0)
+            tout += int(tok.get("output", 0) or 0)
+            cost += float(part.get("cost", 0) or 0)
+        except (ValueError, TypeError):
+            continue
+    return tin, tout, cost
 
 
 class TurnQueue:
@@ -402,6 +428,18 @@ def run_opencode(prompt, session_key, files=None):
     text = strip_json_events(out).strip()
     log.info("[%s] agent reply (%d chars): %r", session_key, len(text),
              text[:1500])
+    tin, tout, cost = extract_usage(out)
+    if tin or tout or cost:
+        u = USAGE.setdefault(session_key,
+                             {"in": 0, "out": 0, "cost": 0.0, "turns": 0})
+        u["in"] += tin
+        u["out"] += tout
+        u["cost"] += cost
+        u["turns"] += 1
+        log.info("[%s] usage this turn: %d in / %d out tokens, $%.4f "
+                 "(session: %d turns, %d in / %d out, $%.4f)",
+                 session_key, tin, tout, cost,
+                 u["turns"], u["in"], u["out"], u["cost"])
     if proc.returncode != 0 and not text:
         err = (proc.stderr or "").strip()[-1500:]
         text = f"opencode exited with code {proc.returncode}."
@@ -488,6 +526,10 @@ def session_key_for(message):
     return f"guild:{message.channel.id}"
 
 
+def _is_dm(channel):
+    return isinstance(channel, discord.DMChannel)
+
+
 async def react(message, emoji):
     """Best-effort add reaction (missing perms just warn)."""
     if not emoji:
@@ -561,7 +603,17 @@ async def deliver_reply(key, channel, messages, reply, inbox, status):
             reply_file = None
 
     try:
+        first = True
         for part in split_smart(reply, MAX_DISCORD):
+            # guilds: thread the first chunk under the user's message
+            if first and messages and not _is_dm(channel):
+                first = False
+                try:
+                    await messages[0].reply(part)
+                    continue
+                except Exception as e:
+                    log.warning("[%s] reply-thread failed, sending plain: %s",
+                                key, e)
             await channel.send(part)
         if reply_file:
             try:
@@ -679,6 +731,7 @@ async def on_message(message):
         await message.channel.send(
             "DM me anything and I'll run it through opencode.\n"
             "`!new` - fresh session (plain message, not /new)\n"
+            "`!status` - session, usage, inbox, queue\n"
             f"`{GUILD_PREFIX} <prompt>` - use me in a server channel\n"
             "Attach + `place this in <dir>` saves files directly.\n"
             "`send me <path>` sends a file back directly.\n"
@@ -689,10 +742,35 @@ async def on_message(message):
     key = session_key_for(message)
     if content.lower() == "!new":
         SESSIONS.pop(key, None)
+        USAGE.pop(key, None)
         save_state(SESSIONS)
         extra = (f" ({len(message.attachments)} attached file(s) ignored - "
                  "resend them now.)" if message.attachments else "")
         await message.channel.send("fresh opencode session started." + extra)
+        return
+
+    if content.lower() == "!status":
+        sid = SESSIONS.get(key, "(none)")
+        u = USAGE.get(key, {"in": 0, "out": 0, "cost": 0.0, "turns": 0})
+        try:
+            inbox = ATTACH_DIR / safe_key(key)
+            nfiles = nbytes = 0
+            for p in inbox.iterdir():
+                if p.is_file():
+                    nfiles += 1
+                    nbytes += p.stat().st_size
+            inbox_s = f"{nfiles} file(s), {nbytes / 1024 / 1024:.1f} MB"
+        except OSError:
+            inbox_s = "n/a"
+        q = get_queue(key)
+        queue_s = (f"running + {len(q.buffer)} pending" if q.running
+                   else "idle")
+        await message.channel.send(
+            f"session `{sid}`\n"
+            f"turns: {u['turns']} | tokens: {u['in']} in / {u['out']} out | "
+            f"cost: ${u['cost']:.4f}\n"
+            f"inbox: {inbox_s}\n"
+            f"queue: {queue_s}")
         return
 
     log.info("[%s] msg from %s (%d attach, %d chars): %r",
