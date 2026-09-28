@@ -6,6 +6,7 @@ Two-way chat between Discord and opencode. DM the bot, it forwards to `opencode 
 - Servers: `@bot` mention or `!oc <prompt>` (per-channel session)
 - `!new`: start a fresh opencode session (plain message with `!`, **not** `/new` — there are no slash commands)
 - `!status`: session id, model, turns, tokens, cost, inbox, queue state
+- `!model`: show current + available; `!model provider/name` to switch, `!model clear` to reset
 - `/sessions`: dropdown browser to switch opencode sessions (servers; DMs after global sync)
 - `/model`: autocomplete to switch the model for this chat
 - `!help`: usage

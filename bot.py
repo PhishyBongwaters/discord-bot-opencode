@@ -826,6 +826,31 @@ def get_models():
     return MODELS_CACHE["items"]
 
 
+def resolve_model_arg(arg, items):
+    """Returns (action, value): show/clear/set/error."""
+    a = (arg or "").strip()
+    if not a:
+        return ("show", None)
+    if a.lower() in ("clear", "default"):
+        return ("clear", None)
+    if items:
+        if a not in items:
+            return ("error", f"unknown model `{a}` - see `!model` list "
+                             "or pick from `/model` autocomplete.")
+        return ("set", a)
+    if "/" not in a:
+        return ("error", f"bad model `{a}` - use provider/model, e.g. "
+                         "`google/gemini-2.5-flash`.")
+    return ("set", a)
+
+
+def current_model_s(key):
+    m = MODEL_OVERRIDES.get(key)
+    if m:
+        return m
+    return f"{OPENCODE_MODEL} (env)" if OPENCODE_MODEL else "opencode default"
+
+
 async def model_autocomplete(interaction: discord.Interaction, current: str):
     items = await asyncio.to_thread(get_models)
     cur = (current or "").lower()
@@ -950,6 +975,7 @@ async def on_ready():
         TREE_SYNCED = True
         for g in client.guilds:
             try:
+                tree.copy_global_to(guild=g)
                 n = await tree.sync(guild=g)
                 log.info("slash synced to %s: %d cmd(s)", g.name, len(n))
             except Exception as e:
@@ -1037,6 +1063,31 @@ async def on_message(message):
             f"cost: ${u['cost']:.4f}\n"
             f"inbox: {inbox_s}\n"
             f"queue: {queue_s}")
+        return
+
+    if content.lower() == "!model" or content.lower().startswith("!model "):
+        arg = content[6:].strip()
+        items = await asyncio.to_thread(get_models)
+        action, value = resolve_model_arg(arg, items)
+        if action == "show":
+            lines = [f"current: `{current_model_s(key)}`"]
+            if items:
+                lines += [f"- `{m}`" for m in items]
+            else:
+                lines.append("(model list unavailable)")
+            for part in split_smart("\n".join(lines), MAX_DISCORD):
+                await message.channel.send(part)
+        elif action == "clear":
+            MODEL_OVERRIDES.pop(key, None)
+            save_state()
+            await message.channel.send("model cleared - back to default.")
+        elif action == "set":
+            MODEL_OVERRIDES[key] = value
+            save_state()
+            log.info("[%s] model override via !model: %s", key, value)
+            await message.channel.send(f"model for this chat: `{value}`.")
+        else:
+            await message.channel.send(value)
         return
 
     log.info("[%s] msg from %s (%d attach, %d chars): %r",
