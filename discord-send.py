@@ -32,6 +32,7 @@ import argparse
 import json
 import os
 import sys
+import time
 import urllib.request
 import urllib.error
 
@@ -39,6 +40,7 @@ from chunking import split_smart
 
 API = "https://discord.com/api/v10"
 MAX_LEN = 2000
+MAX_RETRIES = 3
 
 
 def load_dotenv():
@@ -58,25 +60,36 @@ def load_dotenv():
 
 
 def api(token, method, path, payload=None):
-    req = urllib.request.Request(
-        API + path,
-        data=json.dumps(payload).encode() if payload is not None else None,
-        method=method,
-        headers={
-            "Authorization": f"Bot {token}",
-            "Content-Type": "application/json",
-            "User-Agent": "opencode-discord-send/1.0",
-        },
-    )
-    try:
-        with urllib.request.urlopen(req, timeout=30) as r:
-            return r.status, json.loads(r.read().decode() or "{}")
-    except urllib.error.HTTPError as e:
+    for attempt in range(MAX_RETRIES + 1):
+        req = urllib.request.Request(
+            API + path,
+            data=json.dumps(payload).encode() if payload is not None else None,
+            method=method,
+            headers={
+                "Authorization": f"Bot {token}",
+                "Content-Type": "application/json",
+                "User-Agent": "opencode-discord-send/1.0",
+            },
+        )
         try:
-            body = e.read().decode()
-        except Exception:
-            body = ""
-        return e.code, {"_error": body}
+            with urllib.request.urlopen(req, timeout=30) as r:
+                return r.status, json.loads(r.read().decode() or "{}")
+        except urllib.error.HTTPError as e:
+            try:
+                body = e.read().decode()
+            except Exception:
+                body = ""
+            if e.code == 429 and attempt < MAX_RETRIES:
+                try:
+                    wait = float(json.loads(body or "{}").get("retry_after", 1))
+                except (ValueError, TypeError, AttributeError):
+                    wait = 1 + attempt
+                wait = min(wait + 0.5, 15)
+                print(f"discord-send: rate limited, "
+                      f"retrying in {wait:.1f}s...", file=sys.stderr)
+                time.sleep(wait)
+                continue
+            return e.code, {"_error": body}
 
 
 def die_usage(msg):

@@ -609,10 +609,11 @@ async def on_message(message):
     if content.lower() in ("!help", "help"):
         await message.channel.send(
             "DM me anything and I'll run it through opencode.\n"
-            "`!new` - start a fresh opencode session (plain message, not /new)\n"
+            "`!new` - fresh session (plain message, not /new)\n"
             f"`{GUILD_PREFIX} <prompt>` - use me in a server channel\n"
             "Attach + `place this in <dir>` saves files directly.\n"
-            "`send me <path>` sends a file back directly.")
+            "`send me <path>` sends a file back directly.\n"
+            "Rapid messages merge into one follow-up - wait for the check.")
         return
 
     key = session_key_for(message)
