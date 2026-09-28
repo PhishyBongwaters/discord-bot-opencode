@@ -803,7 +803,14 @@ def list_models():
         return None
     items = [ln.strip() for ln in (proc.stdout or "").splitlines()
              if "/" in ln.strip() and " " not in ln.strip()]
-    return items or None
+    items = [re.sub(r"\x1b\[[0-9;]*[A-Za-z]", "", it) for it in items]
+    items = [it for it in items if "/" in it and " " not in it]
+    if not items:
+        log.warning("model list parsed 0 models (%d chars stdout)",
+                    len(proc.stdout or ""))
+        return None
+    log.info("model list: %d model(s)", len(items))
+    return items
 
 
 def get_models():
