@@ -161,16 +161,16 @@ def use_file_flag(filename, content_type):
 
 
 BRIDGE_NOTE = (
-    "[Discord bridge: text/code/images (incl. gif) are passed with --file "
+    "[Discord bridge: you are chatting through Discord. Use emojis freely "
+    "in your replies, and react to the user's messages with personality - "
+    "match the vibe. To react, put [[react:EMOJI]] on its own line with "
+    "a literal emoji (custom <:name:id> also works, "
+    "shortcodes like :+1: do NOT). Max 5 per turn. "
+    "Text/code/images (incl. gif) the user attaches are passed with --file "
     "AND saved locally; video files (mp4/mov/etc) are NOT inlined - they "
     "are only saved locally, use shell/file tools on the saved path. "
     "To send a file back to the user, put [[attach:FULL_PATH]] on its own "
-    "line, e.g. [[attach:D:\\files\\clip.mp4]]. Use absolute paths. "
-    "To react to the user's message, put [[react:EMOJI]] on its own "
-    "line. React with personality - match the vibe of the message. "
-    "Use a literal emoji (custom <:name:id> also works, "
-    "shortcodes like :+1: do NOT). Max 5 per turn. "
-    "Only attach/react for files the user asked for or you created for them.]"
+    "line, e.g. [[attach:D:\\files\\clip.mp4]]. Use absolute paths.]"
 )
 
 if not TOKEN:
