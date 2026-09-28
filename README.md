@@ -116,4 +116,5 @@ With `DEFAULT_DISCORD_CHANNEL` set in `.env`, omit `--to`. Targets: `#name`, `<c
 - **`mkgy2(1)(2)(3).gif`**: same filename re-sent repeatedly; the inbox dedups instead of overwriting. Safe to delete `attachments/` contents.
 - **My messages got answered together**: that's coalescing — arrivals during a running turn merge into one follow-up. Wait for the check react between messages for separate turns.
 - **Raw tool output in chat**: tool results (`part.type: tool`) are filtered out; only assistant text is forwarded. If dumps leak through on a new event shape, grab the `opencode event types: [...]` DEBUG line and it can be added to the filter.
+- **Operational chatter**: agent/session notices ("Switched agent to Build") are filtered from chat. If a future opencode schema produces zero known chat events, the bot falls back to a greedy extract and logs a warning — noise over silence, and the warning says so.
 - **No reply at all**: check stderr logs (`[dm:...]` / `[guild:...]` lines), verify Message Content intent is on, and that your user id is in `ALLOWED_USER_IDS` (anyone else is silently ignored).
