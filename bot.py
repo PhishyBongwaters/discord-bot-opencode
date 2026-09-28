@@ -344,8 +344,27 @@ def extract_session_id(ndjson_text):
 
 def strip_json_events(ndjson_text):
     """Pull human-readable text out of opencode JSON event output."""
-    parts = []
     seen_types = set()
+
+    # Event types that may carry assistant chat text. Anything else
+    # (steps, sessions, agent notices, ...) is skipped to keep
+    # operational chatter out of Discord.
+    CHAT_TYPES = {"text", "message", "result", "response", "assistant",
+                  "output"}
+
+    def is_chat_event(obj):
+        if not isinstance(obj, dict):
+            return True  # plain-text lines handled by the JSON fallback
+        t = obj.get("type")
+        part = obj.get("part")
+        ptype = part.get("type") if isinstance(part, dict) else None
+        if ptype == "tool" or t == "tool_use":
+            return False  # tool I/O is not chat text
+        if ptype == "text":
+            return True
+        if t is None:
+            return True  # untyped object: inspect content
+        return t in CHAT_TYPES
 
     # Tool I/O envelope keys: never chat text, even when nested elsewhere.
     TOOL_KEYS = {"state", "metadata", "providerCall", "providerResult",
@@ -370,48 +389,63 @@ def strip_json_events(ndjson_text):
                 found.extend(collect_text(item, depth + 1))
         return found
 
-    for line in ndjson_text.splitlines():
-        line = line.strip()
-        if not line:
-            continue
-
-        try:
-            obj = json.loads(line)
-        except json.JSONDecodeError:
-            parts.append(line)
-            continue
-
-        if isinstance(obj, dict):
-            t = obj.get("type")
-            if isinstance(t, str):
-                seen_types.add(t)
-            part = obj.get("part")
-            if isinstance(part, dict):
-                ptype = part.get("type")
-                if isinstance(ptype, str):
-                    seen_types.add(f"part:{ptype}")
-                if ptype == "tool" or t == "tool_use":
-                    continue  # tool I/O is not chat text
-                text = part.get("text")
-                if isinstance(text, str) and text:
-                    parts.append(text)
-                    continue
-            if t == "tool_use":
+    def run_lines(strict):
+        out = []
+        for line in ndjson_text.splitlines():
+            line = line.strip()
+            if not line:
                 continue
-            # fall back to recursive collect for message/result events
-            for s in collect_text(obj):
-                # skip id-like strings and timestamps
-                if s.startswith(("ses_", "prt_", "msg_")):
+            try:
+                obj = json.loads(line)
+            except json.JSONDecodeError:
+                out.append(line)
+                continue
+            if isinstance(obj, dict):
+                t = obj.get("type")
+                if isinstance(t, str):
+                    seen_types.add(t)
+                part = obj.get("part")
+                if isinstance(part, dict):
+                    ptype = part.get("type")
+                    if isinstance(ptype, str):
+                        seen_types.add(f"part:{ptype}")
+                    if ptype == "tool" or t == "tool_use":
+                        continue  # tool I/O is not chat text
+                    if strict and not is_chat_event(obj):
+                        continue
+                    text = part.get("text")
+                    if isinstance(text, str) and text:
+                        out.append(text)
+                        continue
+                elif strict and not is_chat_event(obj):
                     continue
-                if s in ("step-start", "step-finish", "text"):
+                if t == "tool_use":
                     continue
-                parts.append(s)
-        else:
-            parts.append(str(obj))
+                # fall back to recursive collect for message/result events
+                for s in collect_text(obj):
+                    # skip id-like strings and timestamps
+                    if s.startswith(("ses_", "prt_", "msg_")):
+                        continue
+                    if s in ("step-start", "step-finish", "text"):
+                        continue
+                    out.append(s)
+            else:
+                out.append(str(obj))
+        return out
 
+    strict = run_lines(True)
     if seen_types:
         log.debug("opencode event types: %s", sorted(seen_types))
-    return "".join(parts).strip()
+    text = "".join(strict).strip()
+    if text:
+        return text
+    if not ndjson_text.strip():
+        return ""
+    # Last resort: legacy greedy pass (minus tool events) so unknown
+    # future schemas degrade to noise rather than silence - and say so.
+    log.warning("no chat-text events parsed, falling back to greedy "
+                "extract; types=%s", sorted(seen_types))
+    return "".join(run_lines(False)).strip()
 
 def run_opencode(prompt, session_key, files=None, model=None):
     """Run one opencode turn. Returns (reply_text, session_id_or_None)."""
