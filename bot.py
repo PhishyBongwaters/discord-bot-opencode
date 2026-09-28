@@ -126,6 +126,47 @@ SEND_RE = re.compile(
     re.IGNORECASE,
 )
 
+# Explicit react: "react 🍆" / "react to this 👀🫠"
+# Handled directly (no model), so model content moderation can't refuse.
+REACT_CMD_RE = re.compile(r"^react\s+(.+?)\s*$", re.IGNORECASE)
+CUSTOM_EMOJI_RE = re.compile(r"<a?:\w+:\d+>")
+
+
+def _is_emoji_base(o):
+    return (0x1F300 <= o <= 0x1FAFF or 0x2600 <= o <= 0x27BF or
+            0x2B00 <= o <= 0x2BFF or 0x1F1E6 <= o <= 0x1F1FF or
+            0x231A <= o <= 0x23FF or
+            o in (0xA9, 0xAE, 0x203C, 0x2049, 0x2122, 0x2139,
+                  0x24C2, 0x3297, 0x3299, 0x3030, 0x303D))
+
+
+def _is_emoji_cont(o):
+    return (o in (0x200D, 0xFE0F) or 0x1F3FB <= o <= 0x1F3FF or
+            0x1F1E6 <= o <= 0x1F1FF or 0x20D0 <= o <= 0x20FF or
+            0xFE00 <= o <= 0xFE0F or 0xE0020 <= o <= 0xE007F)
+
+
+def extract_emojis(s):
+    """Pull emoji clusters (incl. custom <:name:id>) out of text."""
+    found = CUSTOM_EMOJI_RE.findall(s)
+    s = CUSTOM_EMOJI_RE.sub(" ", s)
+    cur = ""
+    joiner = chr(0x200D)
+    for ch in s:
+        o = ord(ch)
+        if cur and (cur.endswith(joiner) or _is_emoji_cont(o)):
+            cur += ch
+        elif _is_emoji_base(o):
+            if cur:
+                found.append(cur)
+            cur = ch
+        elif cur:
+            found.append(cur)
+            cur = ""
+    if cur:
+        found.append(cur)
+    return found[:MAX_MODEL_REACTS]
+
 
 def resolve_target_dir(path_str):
     p = Path(path_str.strip().strip("'\"")).expanduser()
@@ -168,9 +209,8 @@ BRIDGE_NOTE = (
     "To send a file back to the user, put [[attach:FULL_PATH]] on its own "
     "line, e.g. [[attach:D:\\files\\clip.mp4]]. Use absolute paths. "
     "To react to the user's message, put [[react:EMOJI]] on its own "
-    "line. React with personality - match the vibe of the message "
-    "(funny gets 😂, juicy gets 👀, cursed gets 🫠, yikes gets 😅). "
-    "Use a literal emoji, e.g. [[react:👀]] (custom <:name:id> also works, "
+    "line. React with personality - match the vibe of the message. "
+    "Use a literal emoji (custom <:name:id> also works, "
     "shortcodes like :+1: do NOT). Max 5 per turn. "
     "Only attach/react for files the user asked for or you created for them.]"
 )
@@ -648,6 +688,21 @@ async def on_message(message):
         # not a file path: fall through to opencode for normal chat
         # containing the word "send" (e.g. "send me the report summary")
         log.info("[%s] send pattern but not a file, using opencode: %s", key, p)
+
+    # --- direct react: "react 🍆" applies without opencode ---
+    cmd = REACT_CMD_RE.match(content) if not message.attachments else None
+    if cmd:
+        emojis = extract_emojis(cmd.group(1))
+        if emojis:
+            log.info("[%s] direct react: %s", key, emojis)
+            for e in emojis:
+                try:
+                    await message.add_reaction(e)
+                except Exception as ex:
+                    log.warning("[%s] direct react %r failed: %s", key, e, ex)
+            await swap_react(message, REACT_START, REACT_DONE)
+            return
+        log.info("[%s] react pattern but no emoji, using opencode", key)
 
     status = None
     if message.attachments:
