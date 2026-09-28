@@ -290,11 +290,17 @@ def strip_json_events(ndjson_text):
     parts = []
     seen_types = set()
 
+    # Tool I/O envelope keys: never chat text, even when nested elsewhere.
+    TOOL_KEYS = {"state", "metadata", "providerCall", "providerResult",
+                 "rawInput"}
+
     def collect_text(obj, depth=0):
         # Recursively collect human text; returns list of strings.
         found = []
         if isinstance(obj, dict):
             for k, v in obj.items():
+                if k in TOOL_KEYS:
+                    continue
                 if k in ("text", "content", "delta", "message") and isinstance(v, str) and v:
                     # skip obvious non-text: ids, paths, types
                     if k == "message" and v in ("step-start",):
@@ -322,16 +328,19 @@ def strip_json_events(ndjson_text):
             t = obj.get("type")
             if isinstance(t, str):
                 seen_types.add(t)
-            # skip pure lifecycle events with no text payload
             part = obj.get("part")
             if isinstance(part, dict):
                 ptype = part.get("type")
                 if isinstance(ptype, str):
                     seen_types.add(f"part:{ptype}")
+                if ptype == "tool" or t == "tool_use":
+                    continue  # tool I/O is not chat text
                 text = part.get("text")
                 if isinstance(text, str) and text:
                     parts.append(text)
                     continue
+            if t == "tool_use":
+                continue
             # fall back to recursive collect for message/result events
             for s in collect_text(obj):
                 # skip id-like strings and timestamps
