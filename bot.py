@@ -28,6 +28,7 @@ Config via env (or .env in cwd / ~/.config/opencode-discord/):
     ATTACH_DIR          default ./attachments (inbound inbox)
     MAX_ATTACH_MB       default 25 (in/out file size cap)
     LOG_LEVEL           default INFO (e.g. DEBUG for verbose)
+    REACT_START/DONE/ERROR  default hourglass/check/cross (empty disables)
 
 Required Discord privileged intent: Message Content (toggle in the
 Developer Portal -> Bot -> Privileged Gateway Intents).
@@ -48,6 +49,14 @@ try:
     import discord
 except ImportError:
     sys.exit("discord.py not installed: pip install -r requirements.txt")
+
+# Windows consoles default to cp1252, which mangles opencode's UTF-8 output
+# (emoji becomes ðŸ‘‹-style mojibake) and can crash logging on real emoji.
+try:
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+except Exception:
+    pass
 
 MAX_DISCORD = 2000
 
@@ -80,6 +89,9 @@ GUILD_PREFIX = os.environ.get("GUILD_PREFIX", "!oc")
 ATTACH_DIR = Path(os.environ.get("ATTACH_DIR", "attachments"))
 MAX_ATTACH_MB = float(os.environ.get("MAX_ATTACH_MB", "25"))
 LOG_LEVEL = os.environ.get("LOG_LEVEL", "INFO").upper()
+REACT_START = os.environ.get("REACT_START", "\u23f3")
+REACT_DONE = os.environ.get("REACT_DONE", "\u2705")
+REACT_ERROR = os.environ.get("REACT_ERROR", "\u274c")
 
 logging.basicConfig(
     level=getattr(logging, LOG_LEVEL, logging.INFO),
@@ -167,6 +179,16 @@ def save_state(state):
 
 
 SESSIONS = load_state()  # key -> opencode session id
+
+LOCKS = {}  # key -> asyncio.Lock (one opencode turn at a time per session)
+
+
+def get_lock(key):
+    lock = LOCKS.get(key)
+    if lock is None:
+        lock = asyncio.Lock()
+        LOCKS[key] = lock
+    return lock
 
 
 def extract_session_id(ndjson_text):
@@ -278,7 +300,7 @@ def run_opencode(prompt, session_key, files=None):
     try:
         proc = subprocess.run(
             cmd, cwd=OPENCODE_DIR, capture_output=True, text=True,
-            timeout=OPENCODE_TIMEOUT)
+            encoding="utf-8", errors="replace", timeout=OPENCODE_TIMEOUT)
     except subprocess.TimeoutExpired:
         log.warning("[%s] opencode timed out after %ds", session_key, OPENCODE_TIMEOUT)
         return (f"opencode timed out after {OPENCODE_TIMEOUT}s. "
@@ -354,6 +376,25 @@ def session_key_for(message):
     return f"guild:{message.channel.id}"
 
 
+async def react(message, emoji):
+    """Best-effort add reaction (missing perms just warn)."""
+    if not emoji:
+        return
+    try:
+        await message.add_reaction(emoji)
+    except Exception as e:
+        log.warning("react %r failed: %s", emoji, e)
+
+
+async def swap_react(message, old, new):
+    if old:
+        try:
+            await message.remove_reaction(old, client.user)
+        except Exception as e:
+            log.warning("unreact %r failed: %s", old, e)
+    await react(message, new)
+
+
 @client.event
 async def on_ready():
     log.info("logged in as %s (id %s)", client.user, client.user.id)
@@ -401,6 +442,7 @@ async def on_message(message):
     log.info("[%s] msg from %s (%d attach, %d chars): %r",
              key, message.author, len(message.attachments), len(content),
              content[:200])
+    await react(message, REACT_START)
 
     # --- direct send: "send me <path>" uploads without opencode ---
     send = SEND_RE.match(content) if not message.attachments else None
@@ -409,12 +451,14 @@ async def on_message(message):
         log.info("[%s] direct send: %r -> %s", key, send.group(1), p)
         if p.is_file():
             if p.stat().st_size > MAX_ATTACH_MB * 1024 * 1024:
+                await swap_react(message, REACT_START, REACT_ERROR)
                 await message.channel.send(
                     f"could not send `{p.name}`: exceeds {MAX_ATTACH_MB:g}MB limit")
                 return
             async with message.channel.typing():
                 await message.channel.send(file=discord.File(str(p)))
             log.info("[%s] direct-sent %s (%d bytes)", key, p, p.stat().st_size)
+            await swap_react(message, REACT_START, REACT_DONE)
             return
         # not a file path: fall through to opencode for normal chat
         # containing the word "send" (e.g. "send me the report summary")
@@ -496,6 +540,7 @@ async def on_message(message):
                         await status.delete()
                     except Exception:
                         pass
+                await swap_react(message, REACT_START, REACT_ERROR)
                 await message.channel.send(f"could not create {target}: {e}")
                 return
             moved, errs = [], []
@@ -522,6 +567,8 @@ async def on_message(message):
             lines += [f"- `{p.name}`" for p in moved]
             lines += [f"(failed: {e})" for e in errs]
             await message.channel.send("\n".join(lines))
+            await swap_react(message, REACT_START,
+                             REACT_DONE if moved and not errs else REACT_ERROR)
             return
 
         prompt = content
@@ -533,12 +580,16 @@ async def on_message(message):
                  key, len(prompt), len(local_files), local_files)
         log.debug("[%s] prompt attach notes:\n%s", key, "\n".join(attach_notes) or "(none)")
         log.debug("[%s] full prompt:\n%s", key, prompt[:3000])
-        reply, new_sid = await asyncio.to_thread(
-            run_opencode, prompt, key, local_files)
-    if new_sid and new_sid != SESSIONS.get(key):
-        SESSIONS[key] = new_sid
-        save_state(SESSIONS)
-        log.info("[%s] session: %s", key, new_sid)
+        lock = get_lock(key)
+        if lock.locked():
+            log.info("[%s] turn queued behind active run", key)
+        async with lock:
+            reply, new_sid = await asyncio.to_thread(
+                run_opencode, prompt, key, local_files)
+            if new_sid and new_sid != SESSIONS.get(key):
+                SESSIONS[key] = new_sid
+                save_state(SESSIONS)
+                log.info("[%s] session: %s", key, new_sid)
 
     # --- outbound attachments: [[attach:path]] -> discord.File ---
     reply, out_paths = split_attach_markers(reply)
@@ -569,16 +620,22 @@ async def on_message(message):
         except Exception:
             pass
 
-    for part in chunk(reply):
-        await message.channel.send(part)
-    for p in outbound:
-        log.info("[%s] uploading %s (%d bytes)", key, p, p.stat().st_size)
-        try:
-            await message.channel.send(file=discord.File(str(p)))
-            log.info("[%s] uploaded %s", key, p)
-        except Exception as e:
-            log.exception("[%s] upload failed: %s", key, p)
-            await message.channel.send(f"(failed to attach {p.name}: {e})")
+    try:
+        for part in chunk(reply):
+            await message.channel.send(part)
+        for p in outbound:
+            log.info("[%s] uploading %s (%d bytes)", key, p, p.stat().st_size)
+            try:
+                await message.channel.send(file=discord.File(str(p)))
+                log.info("[%s] uploaded %s", key, p)
+            except Exception as e:
+                log.exception("[%s] upload failed: %s", key, p)
+                await message.channel.send(f"(failed to attach {p.name}: {e})")
+    except Exception:
+        log.exception("[%s] reply send failed", key)
+        await swap_react(message, REACT_START, REACT_ERROR)
+        raise
+    await swap_react(message, REACT_START, REACT_DONE)
 
 
 if __name__ == "__main__":
