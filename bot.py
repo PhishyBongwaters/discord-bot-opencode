@@ -93,6 +93,14 @@ DROP_RE = re.compile(
     re.IGNORECASE,
 )
 
+# Explicit send: "send me <path>" / "send <path>"
+# Handled directly by the bot (discord.File upload) without involving
+# opencode, so the model never judges the filename/content.
+SEND_RE = re.compile(
+    r"^send\s+(?:me\s+)?(.+?)\s*$",
+    re.IGNORECASE,
+)
+
 
 def resolve_target_dir(path_str):
     p = Path(path_str.strip().strip("'\"")).expanduser()
@@ -388,6 +396,24 @@ async def on_message(message):
     log.info("[%s] msg from %s (%d attach, %d chars): %r",
              key, message.author, len(message.attachments), len(content),
              content[:200])
+
+    # --- direct send: "send me <path>" uploads without opencode ---
+    send = SEND_RE.match(content) if not message.attachments else None
+    if send:
+        p = resolve_outbound(send.group(1))
+        log.info("[%s] direct send: %r -> %s", key, send.group(1), p)
+        if p.is_file():
+            if p.stat().st_size > MAX_ATTACH_MB * 1024 * 1024:
+                await message.channel.send(
+                    f"could not send `{p.name}`: exceeds {MAX_ATTACH_MB:g}MB limit")
+                return
+            async with message.channel.typing():
+                await message.channel.send(file=discord.File(str(p)))
+            log.info("[%s] direct-sent %s (%d bytes)", key, p, p.stat().st_size)
+            return
+        # not a file path: fall through to opencode for normal chat
+        # containing the word "send" (e.g. "send me the report summary")
+        log.info("[%s] send pattern but not a file, using opencode: %s", key, p)
 
     status = None
     if message.attachments:
