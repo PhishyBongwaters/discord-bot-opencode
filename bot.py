@@ -810,6 +810,10 @@ def list_models():
                     len(proc.stdout or ""))
         return None
     log.info("model list: %d model(s)", len(items))
+    if len(items) < 10:
+        log.warning("only %d models listed - provider credentials are "
+                    "probably missing from this process's environment",
+                    len(items))
     return items
 
 
