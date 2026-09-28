@@ -137,6 +137,11 @@ def resolve_target_dir(path_str):
 # Marker the model emits to send a file back: [[attach:D:\files\clip.mp4]]
 ATTACH_RE = re.compile(r"\[\[attach:(.+?)\]\]", re.IGNORECASE)
 
+# Marker the model emits to react to the user's message: [[react:👍]]
+# Literal unicode emoji (or custom <:name:id>); shortcodes won't resolve.
+REACT_RE = re.compile(r"\[\[react:(.+?)\]\]", re.IGNORECASE)
+MAX_MODEL_REACTS = 5
+
 # Video is path-only: saved to disk, never passed via --file.
 # The model can't usefully inline video bytes; it just needs the path
 # so shell/file tools can move, copy, or re-send it.
@@ -162,7 +167,10 @@ BRIDGE_NOTE = (
     "are only saved locally, use shell/file tools on the saved path. "
     "To send a file back to the user, put [[attach:FULL_PATH]] on its own "
     "line, e.g. [[attach:D:\\files\\clip.mp4]]. Use absolute paths. "
-    "Only attach files the user asked for or you created for them.]"
+    "To react to the user's message, put [[react:EMOJI]] on its own line "
+    "with a literal emoji, e.g. [[react:👍]] (custom <:name:id> also works, "
+    "shortcodes like :+1: do NOT). Max 5 per turn. "
+    "Only attach/react for files the user asked for or you created for them.]"
 )
 
 if not TOKEN:
@@ -385,6 +393,15 @@ def split_attach_markers(reply):
     return clean, paths
 
 
+def split_react_markers(reply):
+    """Strip [[react:emoji]] markers. Returns (clean_text, [emojis])."""
+    emojis = [m.group(1).strip() for m in REACT_RE.finditer(reply)
+              if m.group(1).strip()]
+    clean = REACT_RE.sub("", reply).strip()
+    clean = re.sub(r"\n{3,}", "\n\n", clean)
+    return clean, emojis[:MAX_MODEL_REACTS]
+
+
 def resolve_outbound(path_str):
     p = Path(path_str.strip().strip("'\"")).expanduser()
     if not p.is_absolute():
@@ -430,6 +447,9 @@ async def deliver_reply(key, channel, messages, reply, inbox, status):
     reply, out_paths = split_attach_markers(reply)
     log.info("[%s] reply: %d chars, %d attach marker(s): %s",
              key, len(reply), len(out_paths), out_paths)
+    reply, model_reacts = split_react_markers(reply)
+    if model_reacts:
+        log.info("[%s] model reacts: %s", key, model_reacts)
     errors = []
     outbound = []
     for pstr in out_paths:
@@ -496,6 +516,12 @@ async def deliver_reply(key, channel, messages, reply, inbox, status):
         for m in messages:
             await swap_react(m, REACT_START, REACT_ERROR)
         return
+    for m in messages:
+        for e in model_reacts:
+            try:
+                await m.add_reaction(e)
+            except Exception as ex:
+                log.warning("[%s] model react %r failed: %s", key, e, ex)
     for m in messages:
         await swap_react(m, REACT_START, REACT_DONE)
 

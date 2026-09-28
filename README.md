@@ -75,7 +75,7 @@ Two-way chat between Discord and opencode. DM the bot, it forwards to `opencode 
 
 **Via opencode:** files save to `attachments/<dm_or_channel>/` and the local path is added to the prompt. Text/code/images (incl. gif) are also passed with `opencode run --file`. True video (`mp4/mov/mkv/avi/webm/m4v/mpg/mpeg/wmv/flv`, any `video/*`) is **path-only** — never inlined, the model uses shell/file tools on the saved path.
 
-**Outbound via opencode:** the model emits `[[attach:D:\files\clip.mp4]]` on its own line; the bot strips the marker and uploads. Missing/oversize files come back as text errors, not silent fails.
+**Outbound via opencode:** the model emits `[[attach:D:\files\clip.mp4]]` on its own line; the bot strips the marker and uploads. Missing/oversize files come back as text errors, not silent fails. The model can also react to your message with `[[react:👍]]` (literal emoji, or custom `<:name:id>`; max 5 per turn, invalid ones are skipped with a console warning).
 
 Model-driven moves/writes require `OPENCODE_AUTO=1` (or an agent that can approve file tools).
 
