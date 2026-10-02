@@ -399,32 +399,36 @@ if not ALLOWED:
 
 
 def load_state():
-    """State shape: {"active": {...}, "known": {...}, "models": {...}, "voice": {...}}."""
+    """State shape: {"active": {...}, "known": {...}, "models": {...},
+    "voice": {...}, "profiles": {...}}."""
     try:
         raw = json.loads(STATE_FILE.read_text())
     except (OSError, json.JSONDecodeError):
-        return {"active": {}, "known": {}, "models": {}, "voice": {}}
+        return {"active": {}, "known": {}, "models": {}, "voice": {},
+                "profiles": {}}
     if isinstance(raw, dict) and isinstance(raw.get("active"), dict):
         known = raw.get("known")
         models = raw.get("models")
         voice = raw.get("voice")
+        profiles = raw.get("profiles")
         return {"active": raw["active"],
                 "known": known if isinstance(known, dict) else {},
                 "models": models if isinstance(models, dict) else {},
-                "voice": voice if isinstance(voice, dict) else {}}
+                "voice": voice if isinstance(voice, dict) else {},
+                "profiles": profiles if isinstance(profiles, dict) else {}}
     # legacy flat {key: sid}
     act = ({k: v for k, v in raw.items() if isinstance(v, str)}
            if isinstance(raw, dict) else {})
     return {"active": act,
             "known": {k: [v] for k, v in act.items()},
-            "models": {}, "voice": {}}
+            "models": {}, "voice": {}, "profiles": {}}
 
 
 def save_state():
     STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
     STATE_FILE.write_text(json.dumps(
         {"active": SESSIONS, "known": KNOWN, "models": MODEL_OVERRIDES,
-         "voice": VOICE_OVERRIDES},
+         "voice": VOICE_OVERRIDES, "profiles": VOICE_PROFILE_OVERRIDES},
         indent=2))
 
 
@@ -433,6 +437,12 @@ SESSIONS = _STATE["active"]  # key -> opencode session id
 KNOWN = _STATE["known"]  # key -> [opencode session ids the bot has used]
 MODEL_OVERRIDES = _STATE["models"]  # key -> "provider/model"
 VOICE_OVERRIDES = _STATE["voice"]  # key -> bool (True = voice on)
+VOICE_PROFILE_OVERRIDES = _STATE["profiles"]  # key -> profile name-or-id
+
+
+def effective_voice_profile(key):
+    """Per-chat voice profile override wins, else the global default."""
+    return VOICE_PROFILE_OVERRIDES.get(key) or VOICEBOX_PROFILE
 
 
 def remember_session(key, sid):
@@ -1057,19 +1067,10 @@ def clean_for_tts(reply):
     return text
 
 
-_VOICE_PROFILE_CACHE = {"at": 0.0, "id": None, "name": ""}
-_VOICE_PROFILE_TTL = 3600
-
-
-def get_voicebox_profile_id():
-    """Resolve VOICEBOX_PROFILE (name or id) to a profile id. None on failure."""
-    if not VOICEBOX_URL or not VOICEBOX_PROFILE:
-        return None
-    now = time.monotonic()
-    if (_VOICE_PROFILE_CACHE["id"]
-            and _VOICE_PROFILE_CACHE["name"] == VOICEBOX_PROFILE
-            and now - _VOICE_PROFILE_CACHE["at"] < _VOICE_PROFILE_TTL):
-        return _VOICE_PROFILE_CACHE["id"]
+def list_voicebox_profiles():
+    """Fetch [(id, name)] from Voicebox. Empty list on any failure."""
+    if not VOICEBOX_URL:
+        return []
     try:
         req = urllib.request.Request(
             f"{VOICEBOX_URL}/profiles",
@@ -1078,43 +1079,59 @@ def get_voicebox_profile_id():
             items = json.loads(r.read().decode("utf-8", "replace"))
     except Exception as e:
         log.warning("voicebox profiles failed: %s", e)
-        return None
+        return []
     if not isinstance(items, list):
+        return []
+    return [(e.get("id"), e.get("name")) for e in items
+            if isinstance(e, dict)]
+
+
+_VOICE_PROFILE_CACHE = {}  # profile name -> {"at": monotonic, "id": pid}
+_VOICE_PROFILE_TTL = 3600
+
+
+def _resolve_profile_name(name):
+    """Resolve a Voicebox profile name-or-id to an id. None on failure."""
+    if not name:
         return None
-    want = VOICEBOX_PROFILE.lower()
-    for e in items:
-        if not isinstance(e, dict):
-            continue
-        if str(e.get("id", "")) == VOICEBOX_PROFILE:
-            _VOICE_PROFILE_CACHE.update(
-                at=now, id=e["id"], name=VOICEBOX_PROFILE)
-            return e["id"]
-    for e in items:
-        if not isinstance(e, dict):
-            continue
-        if str(e.get("name", "")).lower() == want:
-            _VOICE_PROFILE_CACHE.update(
-                at=now, id=e.get("id"), name=VOICEBOX_PROFILE)
-            log.info("voicebox profile %r -> %s", e.get("name"), e.get("id"))
-            return e.get("id")
+    now = time.monotonic()
+    hit = _VOICE_PROFILE_CACHE.get(name)
+    if hit and now - hit["at"] < _VOICE_PROFILE_TTL:
+        return hit["id"]
+    items = list_voicebox_profiles()
+    for pid, pname in items:
+        if str(pid) == name:
+            _VOICE_PROFILE_CACHE[name] = {"at": now, "id": pid}
+            return pid
+    want = name.lower()
+    for pid, pname in items:
+        if str(pname or "").lower() == want:
+            _VOICE_PROFILE_CACHE[name] = {"at": now, "id": pid}
+            log.info("voicebox profile %r -> %s", pname, pid)
+            return pid
     log.warning("voicebox profile %r not found (%d profiles)",
-                VOICEBOX_PROFILE, len(items))
+                name, len(items))
     return None
 
 
-def tts_wav(reply_text):
+def get_voicebox_profile_id(key=None):
+    """Resolve the effective profile (per-chat override else global)."""
+    return _resolve_profile_name(effective_voice_profile(key))
+
+
+def tts_wav(reply_text, key=None):
     """Blocking Voicebox TTS. Returns wav bytes or None (never raises)."""
     if not VOICEBOX_URL:
         return None
-    return tts_wav_clean(clean_for_tts(reply_text or ""))
+    return tts_wav_clean(clean_for_tts(reply_text or ""), key)
 
 
-def tts_wav_clean(text):
+def tts_wav_clean(text, key=None):
     """Blocking Voicebox TTS of pre-cleaned text. None on any failure."""
     if not VOICEBOX_URL or not (text or "").strip():
         return None
     text = text.strip()
-    pid = get_voicebox_profile_id()
+    pid = get_voicebox_profile_id(key)
     if not pid:
         return None
     hit = _tts_cache_get(pid, text)
@@ -1835,12 +1852,12 @@ async def deliver_reply(key, channel, messages, reply, inbox, status):
                 voice_epoch = VC_EPOCHS.get(guild.id, 0)
                 VC_STREAMS[guild.id] = VC_STREAMS.get(guild.id, 0) + 1
                 voice_task = asyncio.ensure_future(
-                    asyncio.to_thread(tts_wav_clean, voice_chunks[0]))
+                    asyncio.to_thread(tts_wav_clean, voice_chunks[0], key))
         else:
             file_text = ("\n".join(say_lines + [voice_text])
                          if say_lines else voice_text)
             voice_task = asyncio.ensure_future(
-                asyncio.to_thread(tts_wav, file_text))
+                asyncio.to_thread(tts_wav, file_text, key))
 
     try:
         first = True
@@ -1910,7 +1927,7 @@ async def deliver_reply(key, channel, messages, reply, inbox, status):
                                          "abandoning remaining chunks", key)
                                 break
                             wav = await asyncio.to_thread(tts_wav_clean,
-                                                          chunk)
+                                                          chunk, key)
                             if wav and gid is not None:
                                 if not await vc_say(gid, wav, inbox,
                                                     voice_epoch):
@@ -2441,6 +2458,7 @@ async def on_message(message):
             "`!new` - fresh session (plain message, not /new)\n"
             "`!status` - session, usage, inbox, queue\n"
             "`!voice [on|off]` - spoken replies via Voicebox (Computer voice)\n"
+            "`!voiceprofile [name-or-id|clear]` - per-chat voice profile\n"
             "`!join` / `!leave` - speak replies in your voice channel (servers)\n"
             "`!say <text>` - speak a line in VC now, no opencode call\n"
             "`!skip` - stop the current VC clip and drop the queue "
@@ -2499,7 +2517,7 @@ async def on_message(message):
         model = MODEL_OVERRIDES.get(key)
         model_s = model if model else (
             f"{OPENCODE_MODEL} (env)" if OPENCODE_MODEL else "opencode default")
-        voice_s = (f"on ({VOICEBOX_PROFILE})" if voice_enabled(key)
+        voice_s = (f"on ({effective_voice_profile(key)})" if voice_enabled(key)
                    else "off")
         guild = getattr(message, "guild", None)
         gvc = guild.voice_client if guild is not None else None
@@ -2549,8 +2567,43 @@ async def on_message(message):
         else:
             state = "on" if voice_enabled(key) else "off"
             await message.channel.send(
-                f"voice replies: `{state}` (profile `{VOICEBOX_PROFILE}`). "
+                f"voice replies: `{state}` "
+                f"(profile `{effective_voice_profile(key)}`). "
                 "`!voice on` / `!voice off` to change.")
+        return
+
+    if content.lower() == "!voiceprofile" or content.lower().startswith(
+            "!voiceprofile "):
+        arg = content[len("!voiceprofile"):].strip()
+        if not arg:
+            cur = VOICE_PROFILE_OVERRIDES.get(key)
+            await message.channel.send(
+                "voice profile for this chat: "
+                f"`{cur or VOICEBOX_PROFILE + ' (global)'}`. "
+                "`!voiceprofile <name-or-id>` to change, "
+                "`!voiceprofile clear` to reset.")
+            return
+        if arg.lower() == "clear":
+            VOICE_PROFILE_OVERRIDES.pop(key, None)
+            save_state()
+            log.info("[%s] voice profile override cleared", key)
+            await message.channel.send(
+                "voice profile cleared - back to global "
+                f"`{VOICEBOX_PROFILE}`.")
+            return
+        pid = await asyncio.to_thread(_resolve_profile_name, arg)
+        if pid is None:
+            items = await asyncio.to_thread(list_voicebox_profiles)
+            names = ", ".join(f"`{n}`" for _, n in items if n)
+            await message.channel.send(
+                f"unknown voice profile `{arg}` - available: "
+                f"{names or '(none found)'}.")
+            return
+        VOICE_PROFILE_OVERRIDES[key] = arg
+        save_state()
+        log.info("[%s] voice profile override: %s", key, arg)
+        await message.channel.send(
+            f"voice profile for this chat: `{arg}`.")
         return
 
     if content.lower() == "!join":
@@ -2659,7 +2712,7 @@ async def on_message(message):
                 "not in any voice channel - `!join` first.")
             return
         async with message.channel.typing():
-            wav = await asyncio.to_thread(tts_wav, line)
+            wav = await asyncio.to_thread(tts_wav, line, key)
         if not wav:
             await message.channel.send("TTS failed - check the bot log.")
             return

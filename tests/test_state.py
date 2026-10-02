@@ -85,13 +85,15 @@ class LoadSaveState(unittest.TestCase):
         self.assertEqual(state["known"], {"k1": ["sid-1"], "k2": ["sid-2"]})
         self.assertEqual(state["models"], {})
         self.assertEqual(state["voice"], {})
+        self.assertEqual(state["profiles"], {})
 
     def test_missing_file_defaults(self):
         tmp = Path(tempfile.mkdtemp()) / "nope.json"
         with mock.patch.object(bot, "STATE_FILE", tmp):
             state = bot.load_state()
         self.assertEqual(state,
-                         {"active": {}, "known": {}, "models": {}, "voice": {}})
+                         {"active": {}, "known": {}, "models": {}, "voice": {},
+                          "profiles": {}})
 
     def test_save_roundtrip(self):
         tmp = Path(tempfile.mkdtemp()) / "sub" / "sessions.json"
@@ -99,11 +101,13 @@ class LoadSaveState(unittest.TestCase):
              mock.patch.object(bot, "SESSIONS", {"k": "sid"}), \
              mock.patch.object(bot, "KNOWN", {"k": ["sid"]}), \
              mock.patch.object(bot, "MODEL_OVERRIDES", {"k": "m"}), \
-             mock.patch.object(bot, "VOICE_OVERRIDES", {"k": True}):
+             mock.patch.object(bot, "VOICE_OVERRIDES", {"k": True}), \
+             mock.patch.object(bot, "VOICE_PROFILE_OVERRIDES", {"k": "Other"}):
             bot.save_state()
             state = bot.load_state()
         self.assertEqual(state["active"], {"k": "sid"})
         self.assertEqual(state["voice"], {"k": True})
+        self.assertEqual(state["profiles"], {"k": "Other"})
 
 
 if __name__ == "__main__":
