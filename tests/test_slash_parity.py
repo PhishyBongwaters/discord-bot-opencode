@@ -82,11 +82,12 @@ class Dispatch(unittest.TestCase):
 
 
 class SlashAdapter(unittest.TestCase):
-    def _interaction(self, user_id="1"):
+    def _interaction(self, user_id="12345"):
         inter = mock.Mock()
         inter.user = FakeAuthor(user_id)
         inter.guild = None
         inter.channel = None
+        inter.channel_id = 555
         inter.response.defer = self._defer
         inter.followup.send = self._followup_send
         return inter
@@ -104,7 +105,9 @@ class SlashAdapter(unittest.TestCase):
         self._defer = _defer
         self._followup_send = _followup_send
         self._admin = bot.ADMIN_USER_IDS
-        bot.ADMIN_USER_IDS = {"1"}
+        # "12345" is allowlisted by the test harness (ALLOWED_USER_IDS) and
+        # admin here, so pass-through tests exercise the inner dispatch.
+        bot.ADMIN_USER_IDS = {"12345"}
 
     def tearDown(self):
         bot.ADMIN_USER_IDS = self._admin
@@ -126,14 +129,23 @@ class SlashAdapter(unittest.TestCase):
         self.assertTrue(all(ephemeral for _, ephemeral in self.sent))
 
     def test_new_cmd_end_to_end(self):
-        inter = self._interaction("1")
+        inter = self._interaction("12345")
         asyncio.run(bot.new_cmd(inter))
         self.assertTrue(any("fresh opencode session" in s
                             for s, _ in self.sent))
 
     def test_denied_is_ephemeral(self):
+        # Outer gate: ALLOWED_USER_IDS applies to slash too (was bypassed).
         inter = self._interaction("9")
         asyncio.run(bot.say_cmd(inter, "hello"))
+        self.assertTrue(any("allow-list" in s for s, _ in self.sent))
+        self.assertTrue(all(ephemeral for _, ephemeral in self.sent))
+
+    def test_inner_tier_denial_still_ephemeral(self):
+        # Allowlisted but not DJ+: the inner tier denial still fires.
+        inter = self._interaction("777")
+        with mock.patch.object(bot, "ALLOWED", {"12345", "777"}):
+            asyncio.run(bot.say_cmd(inter, "hello"))
         self.assertTrue(any("not permitted" in s for s, _ in self.sent))
         self.assertTrue(all(ephemeral for _, ephemeral in self.sent))
 

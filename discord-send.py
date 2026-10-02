@@ -152,12 +152,15 @@ def ensure_dm_channel(token, user_id):
 
 
 def send_chunks(token, channel_id, text):
+    parts = list(split_smart(text, MAX_LEN))
     sent = 0
-    for part in split_smart(text, MAX_LEN):
+    for part in parts:
         status, data = api(token, "POST", f"/channels/{channel_id}/messages",
                            {"content": part})
         if status not in (200, 201):
-            die_delivery(f"POST message -> HTTP {status}: {data}")
+            die_delivery(f"POST message -> HTTP {status}: {data} "
+                         f"(posted {sent} of {len(parts)} chunks before "
+                         f"failing)")
         sent += 1
     return sent
 

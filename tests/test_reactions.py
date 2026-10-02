@@ -230,8 +230,9 @@ class OnReactionAdd(unittest.TestCase):
                               "text": "hello", "prompt": "do thing"}
         calls = []
 
-        async def fake_batches(key, ch, q, batch, inbox, status):
-            calls.append((key, batch))
+        async def fake_batches(key, ch, q, batch, inbox, status,
+                               reply_author_id=None):
+            calls.append((key, batch, reply_author_id))
 
         async def go():
             with mock.patch.object(bot, "run_batches", fake_batches):
@@ -239,9 +240,11 @@ class OnReactionAdd(unittest.TestCase):
                     FakeReaction("🔁", msg), FakeUser(7))
         asyncio.run(go())
         self.assertEqual(len(calls), 1)
-        key, batch = calls[0]
+        key, batch, reply_author_id = calls[0]
         self.assertEqual(key, "k")
         self.assertEqual(batch, [(msg, "do thing", [])])
+        # original prompt author (7) carried through, not the bot
+        self.assertEqual(reply_author_id, 7)
 
 
 if __name__ == "__main__":
