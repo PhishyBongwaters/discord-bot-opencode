@@ -14,7 +14,9 @@
   and appear in `!status`.
 - Presence: Listening when idle, DND "working..." while any turn runs.
 - Other attachments go to opencode via --file (text/code/images incl.
-  gif) or path-only (video); `[[attach:path]]` markers come back as files.
+  gif); video contributes extracted still frames via --file (pure
+  path-only when extraction fails or is disabled); `[[attach:path]]`
+  markers come back as files.
 - No Hermes, no gateway besides this bot. discord-send (sibling script)
   covers the other direction for one-shot sends from shell/opencode.
 
@@ -75,6 +77,12 @@ Config via env (or .env in cwd / ~/.config/opencode-discord/):
                         empty = server default
     VOICEBOX_LANGUAGE   optional STT language hint (e.g. "en"); empty = auto
     FFMPEG_BIN          ffmpeg executable for voice-channel playback (default "ffmpeg")
+    VIDEO_THUMB_FRAMES  still frames extracted per inbound video and passed
+                        via --file so the model sees something (default 4;
+                        0 disables, back to pure path-only)
+    VIDEO_THUMB_EVERY_S seconds between extracted frames (default 5)
+    VIDEO_THUMB_MAX_MB  videos bigger than this get at most 2 frames
+                        (default 200)
     OPUS_LIB            optional explicit path to the Opus DLL (default: looks for
                         libopus-0.x64.dll / opus.dll next to bot.py, then system "opus")
     SAY_DIR             dir watched for *.txt drop-ins the bot speaks in VC (default
@@ -291,6 +299,9 @@ VOICEBOX_TRANSCRIBE = os.environ.get("VOICEBOX_TRANSCRIBE", "1") == "1"
 VOICEBOX_STT_MODEL = os.environ.get("VOICEBOX_STT_MODEL", "").strip()
 VOICEBOX_LANGUAGE = os.environ.get("VOICEBOX_LANGUAGE", "").strip()
 FFMPEG_BIN = os.environ.get("FFMPEG_BIN", "ffmpeg").strip() or "ffmpeg"
+VIDEO_THUMB_FRAMES = _env_int("VIDEO_THUMB_FRAMES", 4)
+VIDEO_THUMB_EVERY_S = _env_int("VIDEO_THUMB_EVERY_S", 5)
+VIDEO_THUMB_MAX_MB = _env_int("VIDEO_THUMB_MAX_MB", 200)
 OPUS_LIB = os.environ.get("OPUS_LIB", "").strip()
 SAY_DIR = Path(os.environ.get("SAY_DIR", "say_queue").strip() or ".bot-voice-disabled")
 SAY_DIR_ENABLED = os.environ.get("SAY_DIR", "say_queue").strip() != ""
@@ -432,6 +443,55 @@ def use_file_flag(filename, content_type):
     return True
 
 
+def extract_video_thumbs(video_path, key="?"):
+    """Extract still frames from a video via ffmpeg. Returns [paths].
+
+    Best-effort and blocking (call via asyncio.to_thread): any failure
+    returns [] and the caller keeps the current path-only behavior.
+    Frames land next to the video so inbox pruning covers them.
+    """
+    if not FFMPEG_BIN or VIDEO_THUMB_FRAMES <= 0:
+        return []
+    vp = Path(video_path)
+    try:
+        size_mb = vp.stat().st_size / (1024 * 1024)
+    except OSError:
+        return []
+    frames = VIDEO_THUMB_FRAMES
+    if size_mb > VIDEO_THUMB_MAX_MB:
+        frames = min(frames, 2)
+    stem = vp.stem
+    outs = []
+    for i in range(frames):
+        out = vp.parent / f"{stem}_thumb{i + 1}.jpg"
+        j = 1
+        while out.exists():
+            out = vp.parent / f"{stem}_thumb{i + 1}({j}).jpg"
+            j += 1
+        cmd = [FFMPEG_BIN, "-y", "-v", "error",
+               "-ss", str(i * VIDEO_THUMB_EVERY_S), "-i", str(vp),
+               "-frames:v", "1", "-vf", "scale=1280:-2", "-q:v", "4",
+               str(out)]
+        try:
+            r = subprocess.run(cmd, capture_output=True, timeout=30)
+        except Exception as e:
+            log.warning("[%s] video thumbs: ffmpeg failed (%s)", key, e)
+            continue
+        if r.returncode != 0:
+            continue
+        try:
+            if out.stat().st_size == 0:
+                out.unlink()
+                continue
+        except OSError:
+            continue
+        outs.append(str(out.resolve()))
+    if outs:
+        log.info("[%s] video thumbs: %d frame(s) from %s",
+                 key, len(outs), vp.name)
+    return outs
+
+
 BRIDGE_NOTE = (
     "[Discord bridge: you are chatting through Discord. Use emojis freely "
     "in your replies, and react to the user's messages with personality - "
@@ -439,8 +499,10 @@ BRIDGE_NOTE = (
     "a literal emoji (custom <:name:id> also works, "
     "shortcodes like :+1: do NOT). Max 5 per turn. "
     "Text/code/images (incl. gif) the user attaches are passed with --file "
-    "AND saved locally; video files (mp4/mov/etc) are NOT inlined - they "
-    "are only saved locally, use shell/file tools on the saved path. "
+    "AND saved locally; video files (mp4/mov/etc) contribute a few "
+    "extracted still frames via --file so you can see the content - the "
+    "full file is only saved locally, use shell/file tools on the saved "
+    "path for anything the frames don't show. "
     "Voice/audio notes the user records are transcribed before you see them - "
     "the transcript appears as [Voice message NAME (Ns): text]; treat it as "
     "what the user said. "
@@ -3084,12 +3146,24 @@ async def on_message(message):
                         f"[Attached file: {att.filename} ({att.size} bytes, "
                         f"{att.content_type or 'unknown type'}) saved at {dest.resolve()}]")
                 else:
-                    log.info("[%s] path-only (video, no --file): %s",
-                             key, dest.resolve())
-                    attach_notes.append(
-                        f"[Attached video: {att.filename} ({att.size} bytes) "
-                        f"saved at {dest.resolve()} - NOT inlined, "
-                        f"use shell/file tools on this path]")
+                    thumbs = await asyncio.to_thread(
+                        extract_video_thumbs, str(dest.resolve()), key)
+                    if thumbs:
+                        local_files.extend(thumbs)
+                        attach_notes.append(
+                            f"[Attached video: {att.filename} ({att.size} "
+                            f"bytes) saved at {dest.resolve()} - "
+                            f"{len(thumbs)} frame(s) inlined via --file "
+                            f"({', '.join(Path(t).name for t in thumbs)}); "
+                            f"use shell/file tools on the saved path for "
+                            f"the full video]")
+                    else:
+                        log.info("[%s] path-only (video, no --file): %s",
+                                 key, dest.resolve())
+                        attach_notes.append(
+                            f"[Attached video: {att.filename} ({att.size} "
+                            f"bytes) saved at {dest.resolve()} - NOT inlined, "
+                            f"use shell/file tools on this path]")
             except Exception as e:
                 log.exception("[%s] save failed: %s", key, att.filename)
                 attach_notes.append(
