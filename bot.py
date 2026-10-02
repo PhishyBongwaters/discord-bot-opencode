@@ -75,6 +75,9 @@ Config via env (or .env in cwd / ~/.config/opencode-discord/):
     VC_AUTOJOIN         voice channel id to join on startup (empty disables)
     VC_AUTOREJOIN       "1" = rejoin the autojoin channel if disconnected
                         unexpectedly (default "1"; `!leave` still sticks)
+    VC_AUTOLEAVE_MINUTES minutes of sitting alone in a VC before the bot
+                        disconnects itself (default 5.0; 0 disables).
+                        `!join` afterwards works normally.
     VOICEBOX_WARMUP     "1" = one silent TTS at startup so the first real reply
                         doesn't pay model-load cost (default "1")
     VOICE_USER_ID       your Discord user id; used by `!voiceready` to check
@@ -215,6 +218,7 @@ SAY_POLL = _env_float("SAY_POLL", 2.0) or 2.0
 SAY_MAX_BYTES = _env_int("SAY_MAX_BYTES", 8192)
 VC_AUTOJOIN = os.environ.get("VC_AUTOJOIN", "").strip()
 VC_AUTOREJOIN = os.environ.get("VC_AUTOREJOIN", "1") == "1"
+VC_AUTOLEAVE_MINUTES = _env_float("VC_AUTOLEAVE_MINUTES", 5.0)
 VOICEBOX_WARMUP = os.environ.get("VOICEBOX_WARMUP", "1") == "1"
 VOICE_USER_ID = os.environ.get("VOICE_USER_ID", "").strip()
 
@@ -1468,6 +1472,91 @@ def vc_drop(guild_id):
 
 VC_TMP = ATTACH_DIR / "_vc"  # staging for say-queue + VC playout clips
 VC_EXPECTED_BYE = set()  # guild ids whose disconnect was a `!leave`
+VC_AUTOLEAVE_TASKS = {}  # guild_id -> asyncio.Task (solo-idle countdown)
+VC_AUTOLEAVE_AT = {}  # guild_id -> monotonic deadline (for `!status`)
+
+
+def _vc_human_count(channel):
+    """Non-bot members currently in a voice channel."""
+    try:
+        return sum(1 for m in channel.members
+                   if not getattr(m, "bot", False))
+    except Exception:
+        return 1  # fail-safe: unknown membership never triggers a leave
+
+
+def _cancel_autoleave(guild_id):
+    task = VC_AUTOLEAVE_TASKS.pop(guild_id, None)
+    VC_AUTOLEAVE_AT.pop(guild_id, None)
+    if task is not None and not task.done():
+        task.cancel()
+
+
+def _arm_autoleave(guild_id, channel_id):
+    """Start the solo-idle countdown. An already-running timer keeps its
+    original deadline: the grace measures continuous alone-time."""
+    task = VC_AUTOLEAVE_TASKS.get(guild_id)
+    if task is not None and not task.done():
+        return
+    delay = VC_AUTOLEAVE_MINUTES * 60
+    VC_AUTOLEAVE_AT[guild_id] = time.monotonic() + delay
+    VC_AUTOLEAVE_TASKS[guild_id] = asyncio.ensure_future(
+        _autoleave_countdown(guild_id, channel_id, delay))
+    log.info("[guild:%s] VC auto-leave armed (%.1f min grace)",
+             guild_id, VC_AUTOLEAVE_MINUTES)
+
+
+def _refresh_autoleave(guild_id):
+    """Arm the timer when the bot sits alone in VC; cancel otherwise."""
+    if not VC_AUTOLEAVE_MINUTES or VC_AUTOLEAVE_MINUTES <= 0:
+        _cancel_autoleave(guild_id)
+        return
+    vc = guild_voice_client(guild_id)
+    if vc is None or not vc.is_connected() or vc.channel is None:
+        _cancel_autoleave(guild_id)
+        return
+    if _vc_human_count(vc.channel) == 0:
+        _arm_autoleave(guild_id, vc.channel.id)
+    else:
+        _cancel_autoleave(guild_id)
+
+
+async def _autoleave_countdown(guild_id, channel_id, delay):
+    task = asyncio.current_task()
+    try:
+        await asyncio.sleep(delay)
+        # re-verify before leaving: never act on stale state (a join or
+        # move since arming cancels the reason, not just the timer)
+        vc = guild_voice_client(guild_id)
+        if vc is None or not vc.is_connected():
+            return
+        ch = vc.channel
+        if ch is None or ch.id != channel_id:
+            return
+        if _vc_human_count(ch) > 0:
+            return
+        VC_EXPECTED_BYE.add(guild_id)  # keep autorejoin from fighting this
+        vc_drop(guild_id)
+        try:
+            vc.stop()
+        except Exception:
+            pass
+        try:
+            await vc.disconnect()
+        except Exception as e:
+            log.warning("[guild:%s] VC auto-leave disconnect failed: %s",
+                        guild_id, e)
+            return
+        log.info("[guild:%s] VC auto-leave: alone %.1f min, disconnected",
+                 guild_id, delay / 60)
+    except asyncio.CancelledError:
+        raise
+    finally:
+        if VC_AUTOLEAVE_TASKS.get(guild_id) is task:
+            VC_AUTOLEAVE_TASKS.pop(guild_id, None)
+            VC_AUTOLEAVE_AT.pop(guild_id, None)
+
+
 SAY_STARTED = False
 SAY_FAIL_AT = {}  # path -> last failed attempt (monotonic)
 
@@ -1581,6 +1670,7 @@ async def autojoin_vc():
         else:
             await ch.connect()
         log.info("VC_AUTOJOIN joined %s", ch.name)
+        _refresh_autoleave(ch.guild.id)
     except Exception as e:
         log.warning("VC_AUTOJOIN join failed: %s", e)
 
@@ -2297,15 +2387,26 @@ async def on_ready():
 @client.event
 async def on_voice_state_update(member, before, after):
     # Bot was disconnected / moved out: drop queued clips for that guild.
-    if member.id == client.user.id and after.channel is None:
-        guild = getattr(before.channel, "guild", None)
-        if guild is not None:
+    if member.id == client.user.id:
+        guild = getattr(after.channel or before.channel, "guild", None)
+        if after.channel is None and guild is not None:
             vc_drop(guild.id)
             log.info("[guild:%s] VC disconnected, queue cleared", guild.id)
             if guild.id in VC_EXPECTED_BYE:
                 VC_EXPECTED_BYE.discard(guild.id)
             elif VC_AUTOREJOIN and VC_AUTOJOIN:
                 asyncio.ensure_future(autorejoin_vc(guild.id))
+        if guild is not None:
+            _refresh_autoleave(guild.id)
+        return
+    # another member moved: re-evaluate solo-idle state where the bot sits
+    guilds = set()
+    for ch in (before.channel, after.channel):
+        g = getattr(ch, "guild", None)
+        if g is not None:
+            guilds.add(g.id)
+    for gid in guilds:
+        _refresh_autoleave(gid)
 
 
 @client.event
@@ -2405,9 +2506,16 @@ async def on_message(message):
         if gvc is not None and gvc.is_connected():
             pending = (VC_QUEUES.get(guild.id).qsize()
                        if VC_QUEUES.get(guild.id) else 0)
+            auto = ""
+            deadline = VC_AUTOLEAVE_AT.get(guild.id)
+            if deadline is not None:
+                rem = deadline - time.monotonic()
+                if rem > 0:
+                    auto = (f", auto-leave in {int(rem // 60)}m"
+                            f"{int(rem % 60):02d}s")
             vc_s = (f"in #{gvc.channel.name} "
                     f"({'speaking' if gvc.is_playing() else 'idle'}"
-                    f"{f', {pending} queued' if pending else ''})"
+                    f"{f', {pending} queued' if pending else ''}{auto})"
                     if gvc.channel else "connected")
         else:
             vc_s = "not connected (`!join` in a server)"
@@ -2483,6 +2591,7 @@ async def on_message(message):
         except Exception as e:
             log.exception("[%s] VC join failed", key)
             await message.channel.send(f"could not join `{target.name}`: {e}")
+        _refresh_autoleave(guild.id)
         return
 
     if content.lower() in ("!leave", "!disconnect", "!stop"):

@@ -134,6 +134,8 @@ Per-chat control: `!voice off` mutes spoken replies entirely (VC or file), `!voi
 
 **Staying in VC:** set `VC_AUTOJOIN` to a voice channel id and the bot joins it on startup and sits there until restart (`VC_AUTOREJOIN=1` rejoins after unexpected drops; `!leave` is still respected and sticks). Find the id by right-clicking the channel → Copy Channel ID (Developer Mode on).
 
+**Auto-leave when alone:** if the bot ends up alone in a voice channel (everyone left, or it autojoned into an empty one), it disconnects itself after `VC_AUTOLEAVE_MINUTES` (default 5, `0` disables) — the playback queue is dropped and a log line is written. Someone rejoining cancels the countdown; `!status` shows it while armed. `VC_AUTOREJOIN` never fights an auto-leave, and a later `!join` works normally.
+
 **Readiness gate:** `!voiceready` checks all four preconditions and reports `OK`/`FAIL` per line: Voicebox reachable (with ping ms), Discord gateway connected, bot in a VC, and you in the same VC (needs `VOICE_USER_ID` set, else skipped). Run it before a voice session instead of guessing.
 
 **Fail-safe auto-off:** 3 consecutive Voicebox *connection* failures (unreachable/down — not HTTP errors, which mean it's alive) delete the `.opencode/voice-mode.on` flag and log `voice mode auto-disabled`. Say `voice mode on` to re-enable once Voicebox is back. The bot can only detect this while running, so a dead gateway (bot itself down) just means no voice at all until restart.
