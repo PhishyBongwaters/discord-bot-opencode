@@ -656,18 +656,26 @@ def _drop_prompt_msgs(key):
         PROMPT_MSGS.pop(mid, None)
 
 
-def _record_reply(sent, key, messages, reply):
+def _reply_record_text(say_lines, voice_text):
+    """Full delivered text remembered for 🔊 replay.
+
+    Captured before the reply-as-file placeholder swap: the placeholder
+    ("reply too long (N chars)...") must never be what gets re-spoken."""
+    return "\n".join(say_lines + [voice_text]) if say_lines else voice_text
+
+
+def _record_reply(sent, key, messages, reply, author_id=None):
     """Remember a posted bot reply for 🔊/🔁 reaction controls."""
     try:
         mid = sent.id
     except Exception:
         return
-    author_id = None
-    try:
-        if messages:
-            author_id = messages[0].author.id
-    except Exception:
-        pass
+    if author_id is None:
+        try:
+            if messages:
+                author_id = messages[0].author.id
+        except Exception:
+            pass
     REPLY_MSGS[mid] = {"key": key, "author_id": author_id, "text": reply,
                        "prompt": REGEN_PROMPTS.get(key)}
     while len(REPLY_MSGS) > MAX_REPLY_MSGS:
@@ -2013,6 +2021,8 @@ async def react(message, emoji):
     """Best-effort add reaction (missing perms just warn)."""
     if not emoji:
         return
+    if getattr(getattr(message, "author", None), "bot", False):
+        return  # never react to our own messages (🔁 regen path)
     try:
         await message.add_reaction(emoji)
     except Exception as e:
@@ -2020,6 +2030,8 @@ async def react(message, emoji):
 
 
 async def swap_react(message, old, new):
+    if getattr(getattr(message, "author", None), "bot", False):
+        return  # our own message (🔁 regen path): no working reacts
     if old:
         try:
             await message.remove_reaction(old, client.user)
@@ -2028,7 +2040,8 @@ async def swap_react(message, old, new):
     await react(message, new)
 
 
-async def deliver_reply(key, channel, messages, reply, inbox, status):
+async def deliver_reply(key, channel, messages, reply, inbox, status,
+                        reply_author_id=None):
     """Send one turn's reply + outbound files. Swaps working reacts."""
     # --- outbound attachments: [[attach:path]] -> discord.File ---
     reply, out_paths = split_attach_markers(reply)
@@ -2134,13 +2147,17 @@ async def deliver_reply(key, channel, messages, reply, inbox, status):
                 first = False
                 try:
                     sent = await messages[0].reply(part)
-                    _record_reply(sent, key, messages, reply)
+                    _record_reply(sent, key, messages,
+                                  _reply_record_text(say_lines, voice_text),
+                                  reply_author_id)
                     continue
                 except Exception as e:
                     log.warning("[%s] reply-thread failed, sending plain: %s",
                                 key, e)
             sent = await channel.send(part)
-            _record_reply(sent, key, messages, reply)
+            _record_reply(sent, key, messages,
+                          _reply_record_text(say_lines, voice_text),
+                          reply_author_id)
         if reply_file:
             try:
                 await channel.send(
@@ -2682,6 +2699,16 @@ async def _run_slash(interaction, text):
     """Shared slash entry: defer ephemeral, then run the !-equivalent
     text through handle_text_command (same behavior, ephemeral replies)."""
     await interaction.response.defer(ephemeral=True)
+    # Same outer allow-list as on_message: slash must not bypass
+    # ALLOWED_USER_IDS (README documents it as the outer gate).
+    if ALLOWED and str(interaction.user.id) not in ALLOWED:
+        log.info("slash denied for non-allowlisted user %s", interaction.user.id)
+        try:
+            await interaction.followup.send(
+                "You're not on this bot's allow-list.", ephemeral=True)
+        except Exception:
+            pass
+        return
     msg = _SlashMessage(interaction)
     key = key_for_interaction(interaction)
     await handle_text_command(msg, text, key)
@@ -3345,9 +3372,18 @@ async def on_message(message):
                     f"[Attachment skipped: {att.filename} ({size_mb:.1f}MB "
                     f"exceeds {MAX_ATTACH_MB:g}MB limit)]")
                 continue
-            orig_stem = Path(att.filename).stem
-            orig_suffix = Path(att.filename).suffix
-            dest = inbox / att.filename
+            orig_stem, orig_suffix = _safe_inbox_name(att.filename)
+            # Never let a hostile name escape the inbox: separators, "..",
+            # drive paths and absolute names all collapse to a plain leaf.
+            dest = inbox / f"{orig_stem}{orig_suffix}"
+            try:
+                dest.resolve().relative_to(inbox.resolve())
+            except ValueError:
+                log.warning("[%s] inbound refused (escapes inbox): %r",
+                            key, att.filename)
+                attach_notes.append(
+                    f"[Attachment skipped: {att.filename} (unsafe filename)]")
+                continue
             # avoid overwriting: file(1).ext (keep original stem)
             i = 1
             while dest.exists():
