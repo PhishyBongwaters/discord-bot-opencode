@@ -84,6 +84,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -386,6 +387,15 @@ def get_queue(key):
     return q
 
 
+class TurnCancelled(Exception):
+    """Raised inside run_opencode when !cancel kills the in-flight run."""
+    pass
+
+
+TURN_LOCK = threading.Lock()
+TURN_STATE = {}  # key -> {"proc": Popen|None, "cancelled": bool}
+
+
 ACTIVE_TURNS = 0
 ACTIVE_GUARD = asyncio.Lock()
 TREE_SYNCED = False
@@ -556,28 +566,59 @@ def run_opencode(prompt, session_key, files=None, model=None):
              session_key, session_id or "(new)", len(files or []),
              OPENCODE_TIMEOUT, OPENCODE_DIR)
     log.debug("[%s] cmd: %s", session_key, cmd)
+    with TURN_LOCK:
+        st = TURN_STATE.setdefault(
+            session_key, {"proc": None, "cancelled": False})
     t0 = time.monotonic()
     try:
-        proc = subprocess.run(
-            cmd, cwd=OPENCODE_DIR, capture_output=True, text=True,
-            encoding="utf-8", errors="replace", timeout=OPENCODE_TIMEOUT)
-    except subprocess.TimeoutExpired:
-        log.warning("[%s] opencode timed out after %ds", session_key, OPENCODE_TIMEOUT)
-        return (f"opencode timed out after {OPENCODE_TIMEOUT}s. "
-                "Your session is kept; try a smaller task or `!new`."), session_id
+        proc = subprocess.Popen(
+            cmd, cwd=OPENCODE_DIR, stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE, text=True,
+            encoding="utf-8", errors="replace")
     except FileNotFoundError:
         log.error("[%s] could not execute %r", session_key, OPENCODE_BIN)
         return (f"could not execute `{OPENCODE_BIN}` - is opencode installed "
                 "and on PATH?"), session_id
+    except OSError as e:
+        log.error("[%s] could not start %r: %s", session_key, OPENCODE_BIN, e)
+        return (f"could not execute `{OPENCODE_BIN}` - is opencode installed "
+                "and on PATH?"), session_id
+    with TURN_LOCK:
+        st["proc"] = proc
+    try:
+        out, err = proc.communicate(timeout=OPENCODE_TIMEOUT)
+    except subprocess.TimeoutExpired:
+        with TURN_LOCK:
+            cancelled = st.get("cancelled")
+        try:
+            proc.kill()
+        except Exception:
+            pass
+        try:
+            out, err = proc.communicate(timeout=30)
+        except Exception:
+            out, err = "", ""
+        if cancelled:
+            log.info("[%s] opencode cancelled during run", session_key)
+            raise TurnCancelled()
+        log.warning("[%s] opencode timed out after %ds", session_key, OPENCODE_TIMEOUT)
+        return (f"opencode timed out after {OPENCODE_TIMEOUT}s. "
+                "Your session is kept; try a smaller task or `!new`."), session_id
+    with TURN_LOCK:
+        cancelled = st.get("cancelled")
+    if cancelled:
+        log.info("[%s] opencode cancelled during run", session_key)
+        raise TurnCancelled()
 
-    out = proc.stdout or ""
+    out = out or ""
+    err = err or ""
+    rc = proc.returncode
     dt = time.monotonic() - t0
     log.info("[%s] opencode done in %.1fs: rc=%d stdout=%d chars stderr=%d chars",
-             session_key, dt, proc.returncode, len(out),
-             len(proc.stderr or ""))
+             session_key, dt, rc, len(out), len(err))
     log.debug("[%s] stdout:\n%s", session_key, out)
-    if proc.stderr:
-        log.debug("[%s] stderr:\n%s", session_key, proc.stderr)
+    if err:
+        log.debug("[%s] stderr:\n%s", session_key, err)
     new_sid = extract_session_id(out) or session_id
     text = strip_json_events(out).strip()
     log.info("[%s] agent reply (%d chars): %r", session_key, len(text),
@@ -594,11 +635,11 @@ def run_opencode(prompt, session_key, files=None, model=None):
                  "(session: %d turns, %d in / %d out, $%.4f)",
                  session_key, tin, tout, cost,
                  u["turns"], u["in"], u["out"], u["cost"])
-    if proc.returncode != 0 and not text:
-        err = (proc.stderr or "").strip()[-1500:]
-        text = f"opencode exited with code {proc.returncode}."
-        if err:
-            text += f"\n```\n{err}\n```"
+    if rc != 0 and not text:
+        tail = err.strip()[-1500:]
+        text = f"opencode exited with code {rc}."
+        if tail:
+            text += f"\n```\n{tail}\n```"
     if not text:
         text = "(opencode returned no text)"
     return text, new_sid
@@ -1490,6 +1531,58 @@ async def deliver_reply(key, channel, messages, reply, inbox, status):
         await swap_react(m, REACT_START, REACT_DONE)
 
 
+async def cancel_turn(key, channel):
+    """Cancel the in-flight opencode run for key.
+
+    Kills the running subprocess (if any), drops the queued follow-up
+    buffer, and posts a confirmation. Never touches voice playback or
+    other sessions. Returns True when something was stopped or dropped.
+    """
+    q = get_queue(key)
+    with TURN_LOCK:
+        st = TURN_STATE.get(key)
+        proc = st["proc"] if st else None
+        alive = proc is not None and proc.poll() is None
+        if alive:
+            st["cancelled"] = True
+    async with q.guard:
+        pending = q.buffer
+        q.buffer = []
+        running = q.running
+    for m, _, _ in pending:
+        await swap_react(m, REACT_START, REACT_ERROR)
+    if alive:
+        try:
+            proc.terminate()
+        except Exception as e:
+            log.warning("[%s] cancel terminate failed: %s", key, e)
+        n = len(pending)
+        extra = (f" (also dropped {n} queued message(s))" if n else "")
+        log.info("[%s] turn cancelled by user%s", key, extra)
+        await channel.send(
+            f"cancelled the running turn for this chat.{extra}")
+        return True
+    if running or pending:
+        # Turn already reached the reply/voice stage (or sits between
+        # batches): no subprocess left, just drop the queued buffer.
+        n = len(pending)
+        if n:
+            log.info("[%s] cancel during reply stage: dropped %d queued",
+                     key, n)
+            await channel.send(
+                f"no in-flight opencode run (already replying) - "
+                f"dropped {n} queued message(s).")
+        else:
+            await channel.send(
+                "no in-flight opencode run (already replying) - "
+                "nothing queued.")
+        return True
+    with TURN_LOCK:
+        TURN_STATE.pop(key, None)  # stale dead-proc entry, if any
+    await channel.send("nothing running for this chat.")
+    return False
+
+
 async def run_batches(key, channel, q, batch, inbox, status):
     """Run one turn, then single follow-up turns for coalesced arrivals."""
     global ACTIVE_TURNS
@@ -1509,10 +1602,32 @@ async def run_batches(key, channel, q, batch, inbox, status):
                      key, len(batch), len(combined), len(files),
                      MODEL_OVERRIDES.get(key) or OPENCODE_MODEL or "(default)")
             log.debug("[%s] full prompt:\n%s", key, combined[:3000])
-            async with channel.typing():
-                reply, new_sid = await asyncio.to_thread(
-                    run_opencode, combined, key, files,
-                    MODEL_OVERRIDES.get(key))
+            with TURN_LOCK:
+                TURN_STATE[key] = {"proc": None, "cancelled": False}
+            try:
+                async with channel.typing():
+                    reply, new_sid = await asyncio.to_thread(
+                        run_opencode, combined, key, files,
+                        MODEL_OVERRIDES.get(key))
+            except TurnCancelled:
+                log.info("[%s] turn cancelled, no reply posted", key)
+                with TURN_LOCK:
+                    TURN_STATE.pop(key, None)
+                async with q.guard:
+                    rest = q.buffer
+                    q.buffer = []
+                for m in msgs:
+                    await swap_react(m, REACT_START, REACT_ERROR)
+                for m, _, _ in rest:
+                    await swap_react(m, REACT_START, REACT_ERROR)
+                if status is not None:
+                    try:
+                        await status.delete()
+                    except Exception:
+                        pass
+                return
+            with TURN_LOCK:
+                TURN_STATE.pop(key, None)
             if new_sid and new_sid != SESSIONS.get(key):
                 SESSIONS[key] = new_sid
                 remember_session(key, new_sid)
@@ -1855,6 +1970,8 @@ async def on_message(message):
             "`!join` / `!leave` - speak replies in your voice channel (servers)\n"
             "`!say <text>` - speak a line in VC now, no opencode call\n"
             "`!voiceready` - check voicebox + discord + VC + you-in-VC\n"
+            "`!cancel` - stop the running turn (kills this run; send again "
+            "if a follow-up started)\n"
             f"`{GUILD_PREFIX} <prompt>` - use me in a server channel\n"
             "Attach + `place this in <dir>` saves files directly.\n"
             "`send me <path>` sends a file back directly.\n"
@@ -1865,6 +1982,10 @@ async def on_message(message):
         return
 
     key = session_key_for(message)
+    if content.lower() == "!cancel":
+        await cancel_turn(key, message.channel)
+        return
+
     if content.lower() == "!new":
         SESSIONS.pop(key, None)
         USAGE.pop(key, None)
