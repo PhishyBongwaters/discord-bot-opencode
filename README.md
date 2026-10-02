@@ -102,7 +102,7 @@ Two-way chat between Discord and opencode. DM the bot, it forwards to `opencode 
 
 **Via opencode:** files save to `attachments/<dm_or_channel>/` and the local path is added to the prompt. Text/code/images (incl. gif) are also passed with `opencode run --file`. True video (`mp4/mov/mkv/avi/webm/m4v/mpg/mpeg/wmv/flv`, any `video/*`) is **path-only** — never inlined, the model uses shell/file tools on the saved path. Audio notes (`ogg/opus/mp3/wav/m4a/flac/aac/webm`, any `audio/*`) are **transcribed** via Voicebox first — opencode sees `[Voice message NAME (Ns): transcript]`, never the raw bytes (falls back to `--file` if transcription fails).
 
-**Outbound via opencode:** the model emits `[[attach:D:\files\clip.mp4]]` on its own line; the bot strips the marker and uploads. Markers pointing at nonexistent files are silently skipped (quoted doc examples must never spam the channel); oversize files come back as text errors. The model can also react to your message with `[[react:EMOJI]]` (literal emoji, or custom `<:name:id>`; max 5 per turn, invalid ones are skipped with a console warning).
+**Outbound via opencode:** the model emits `[[attach:D:\files\clip.mp4]]` on its own line; the bot strips the marker and uploads. Markers pointing at nonexistent files are silently skipped (quoted doc examples must never spam the channel); oversize files come back as text errors. `[[say:Deploy complete.]` (max 3 per turn) is a spoken-only aside — stripped from text, played in VC when live, else folded into `reply.wav`. The model can also react to your message with `[[react:EMOJI]]` (literal emoji, or custom `<:name:id>`; max 5 per turn, invalid ones are skipped with a console warning).
 
 Model-driven moves/writes require `OPENCODE_AUTO=1` (or an agent that can approve file tools).
 
@@ -111,7 +111,7 @@ Model-driven moves/writes require `OPENCODE_AUTO=1` (or an agent that can approv
 Full async voice loop backed by Voicebox (`VOICEBOX_URL`, on by default — no `PyNaCl`/`davey`/Opus needed for any of this):
 
 - **You → bot:** record a Discord voice note (or attach audio). The bot transcribes it via Voicebox Whisper and opencode sees `[Voice message voice-message.ogg (12.4s): ...]`. Send a note alone or with text. If transcription fails, the raw file falls back to `--file`.
-- **Bot → you:** every reply is also spoken in `VOICEBOX_PROFILE` (default `Computer`). Long replies are truncated to `VOICEBOX_MAX_CHARS` for speech; full text always posts. Code fences, `[[attach:]]`/`[[react:]]` markers, and markdown links are stripped before speaking.
+- **Bot → you:** every reply is also spoken in `VOICEBOX_PROFILE` (default `Computer`). Speech is capped at `VOICEBOX_MAX_CHARS` (full text always posts); long replies stream sentence-by-sentence (first audio starts while later sentences still generate), short ones go as one clip. Code fences, `[[attach:]]`/`[[react:]]`/`[[say:]]` markers, and markdown links are stripped before speaking. The model is told its reply will be heard, so it front-loads conclusions and keeps code in `[[attach:]]` files — and it can emit `[[say:line]]` (max 3) for spoken-only asides that stay out of the text.
 
 Spoken delivery, in order of preference:
 

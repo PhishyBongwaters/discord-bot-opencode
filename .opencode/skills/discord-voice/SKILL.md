@@ -71,6 +71,15 @@ and opencode sees `[Voice message NAME (Ns): transcript]`. There is NO live
 VC listening (discord.py cannot receive audio) — voice notes are the input
 path. STT failure falls back to `--file`, never silence.
 
+## Model markers (what the backend model can emit)
+
+- `[[attach:FULL_PATH]]` — upload a file, stripped from text.
+- `[[say:line]]` (max 3/turn) — spoken-only aside, stripped from text,
+  played first in VC when live, else folded into `reply.wav`.
+- `[[react:EMOJI]]` (max 5/turn) — react to the user's message.
+- The bridge prompt tells the model its reply will be heard (VC live vs
+  audio file), so it front-loads conclusions and keeps code in files.
+
 ## Voice mode (agent behavior toggle)
 
 When the user enables voice mode ("voice mode on", or the flag file

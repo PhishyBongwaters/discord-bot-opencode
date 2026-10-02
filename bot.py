@@ -221,6 +221,11 @@ ATTACH_RE = re.compile(r"\[\[attach:(.+?)\]\]", re.IGNORECASE)
 REACT_RE = re.compile(r"\[\[react:(.+?)\]\]", re.IGNORECASE)
 MAX_MODEL_REACTS = 5
 
+# Marker the model emits for a spoken-only aside: [[say:Deploy complete.]]
+# Stripped from text, spoken in VC when live (else folded into reply.wav).
+SAY_RE = re.compile(r"\[\[say:(.+?)\]\]", re.IGNORECASE)
+MAX_MODEL_SAYS = 3
+
 # Video is path-only: saved to disk, never passed via --file.
 # The model can't usefully inline video bytes; it just needs the path
 # so shell/file tools can move, copy, or re-send it.
@@ -255,6 +260,27 @@ BRIDGE_NOTE = (
     "To send a file back to the user, put [[attach:FULL_PATH]] on its own "
     "line, e.g. [[attach:D:\\files\\clip.mp4]]. Use absolute paths.]"
 )
+
+BRIDGE_VOICE_NOTE = (
+    "[Voice output: this reply is ALSO spoken aloud {where}. Write to be "
+    "heard: conclusion first, conversational, short - code/logs go in "
+    "[[attach:]] files, never inline (inline code is read aloud literally "
+    "and sounds terrible). For a spoken-only aside that stays out of the "
+    "text, put [[say:your line]] on its own line (max 3 per turn).]"
+)
+
+
+def bridge_note_for(key, channel):
+    """Base bridge note + voice paragraph when this chat is heard."""
+    if not voice_enabled(key):
+        return BRIDGE_NOTE
+    guild = getattr(channel, "guild", None)
+    vc = guild_voice_client(guild.id) if guild is not None else None
+    if vc is not None and vc.is_connected():
+        where = "live in the voice channel"
+    else:
+        where = "as an attached audio file"
+    return f"{BRIDGE_NOTE}\n{BRIDGE_VOICE_NOTE.format(where=where)}"
 
 if not TOKEN:
     _TOKEN_ERROR = "DISCORD_BOT_TOKEN is not set (env or .env file)"
@@ -632,6 +658,15 @@ def split_react_markers(reply):
     clean = REACT_RE.sub("", reply).strip()
     clean = re.sub(r"\n{3,}", "\n\n", clean)
     return clean, emojis[:MAX_MODEL_REACTS]
+
+
+def split_say_markers(reply):
+    """Strip [[say:line]] markers. Returns (clean_text, [lines])."""
+    lines = [m.group(1).strip() for m in SAY_RE.finditer(reply)
+             if m.group(1).strip()]
+    clean = SAY_RE.sub("", reply).strip()
+    clean = re.sub(r"\n{3,}", "\n\n", clean)
+    return clean, lines[:MAX_MODEL_SAYS]
 
 
 def resolve_outbound(path_str):
@@ -1292,6 +1327,9 @@ async def deliver_reply(key, channel, messages, reply, inbox, status):
     reply, model_reacts = split_react_markers(reply)
     if model_reacts:
         log.info("[%s] model reacts: %s", key, model_reacts)
+    reply, say_lines = split_say_markers(reply)
+    if say_lines:
+        log.info("[%s] model says: %s", key, say_lines)
     errors = []
     outbound = []
     for pstr in out_paths:
@@ -1339,24 +1377,29 @@ async def deliver_reply(key, channel, messages, reply, inbox, status):
             reply_file = None
 
     # --- voice pre-flight: start TTS while the text posts (overlap) ---
-    # VC connected -> stream sentence chunks (first audio ASAP).
-    # Otherwise -> one wav attached as reply.wav.
+    # VC connected -> stream sentence chunks (say-lines first, first audio ASAP).
+    # Otherwise -> one wav (say-lines folded in) attached as reply.wav.
     voice_task = None
     voice_chunks = None
     voice_stream = False
-    if voice_enabled(key) and voice_text.strip():
+    say_chunks = [c for s in say_lines
+                  for c in split_sentences(clean_for_tts(s))]
+    if voice_enabled(key) and (voice_text.strip() or say_chunks):
         guild = getattr(channel, "guild", None)
         if guild is not None:
             vc = guild_voice_client(guild.id)
             voice_stream = vc is not None and vc.is_connected()
         if voice_stream:
-            voice_chunks = split_sentences(clean_for_tts(voice_text))
+            voice_chunks = say_chunks + split_sentences(
+                clean_for_tts(voice_text))
             if voice_chunks:
                 voice_task = asyncio.ensure_future(
                     asyncio.to_thread(tts_wav_clean, voice_chunks[0]))
         else:
+            file_text = ("\n".join(say_lines + [voice_text])
+                         if say_lines else voice_text)
             voice_task = asyncio.ensure_future(
-                asyncio.to_thread(tts_wav, voice_text))
+                asyncio.to_thread(tts_wav, file_text))
 
     try:
         first = True
@@ -1459,7 +1502,8 @@ async def run_batches(key, channel, q, batch, inbox, status):
         while True:
             msgs = [m for m, _, _ in batch]
             combined = "\n\n---\n\n".join(p for _, p, _ in batch)
-            combined = f"{combined}\n{BRIDGE_NOTE}" if combined else BRIDGE_NOTE
+            note = bridge_note_for(key, channel)
+            combined = f"{combined}\n{note}" if combined else note
             files = [f for _, _, fs in batch for f in fs]
             log.info("[%s] turn: %d msg(s), %d chars + %d files, model=%s",
                      key, len(batch), len(combined), len(files),
