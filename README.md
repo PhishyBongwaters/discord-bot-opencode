@@ -5,8 +5,9 @@ Two-way chat between Discord and opencode. DM the bot, it forwards to `opencode 
 - DMs: any message goes to opencode (per-user session)
 - Servers: `@bot` mention or `!oc <prompt>` (per-channel session)
 - `!new`: start a fresh opencode session (plain message with `!`, **not** `/new` — there are no slash commands)
-- `!status`: session id, model, voice/VC state, turns, tokens, cost, inbox, queue state
+- `!status`: session id, model, voice/VC state, say-queue pending, turns, tokens, cost, inbox, queue state
 - `!voice [on|off]`: spoken replies via Voicebox (Computer voice); `!join` / `!leave`: speak replies in your voice channel (servers)
+- `!say <text>`: speak a line in VC now, no opencode call; `!voiceready`: readiness check (voicebox + discord + VC + you-in-VC)
 - `!model`: show current + available; `!model provider/name` to switch, `!model clear` to reset
 - `/sessions`: dropdown browser to switch opencode sessions (servers; DMs after global sync)
 - `/model`: autocomplete to switch the model for this chat
@@ -43,6 +44,7 @@ Two-way chat between Discord and opencode. DM the bot, it forwards to `opencode 
    ```
    python bot.py
    ```
+5. Voice (optional): with Voicebox running (`VOICEBOX_URL`), set `VC_AUTOJOIN` to your voice channel id (right-click → Copy Channel ID) and `VOICE_USER_ID` to your user id — then `!voiceready` in Discord confirms the whole loop. Details in Voice below.
 
 ## Config reference
 
@@ -128,7 +130,7 @@ Per-chat control: `!voice off` mutes spoken replies entirely (VC or file), `!voi
 
 **Say-queue (agent-initiated speech):** the bot watches `SAY_DIR` (default `say_queue/`) every `SAY_POLL` seconds. Drop in a `.txt` file and it speaks it in VC via the same Computer voice — no Discord message needed, no opencode call. Plain `*.txt` plays in every connected VC; `<guildid>_*.txt` targets one server. Files are deleted after speaking; if no VC is connected they're held until one is (TTS failures retry with backoff). This is the path for speaking *from* a shell/agent session: anything that can write a file (including opencode itself mid-turn, or another harness) can make the bot talk. `!say <text>` is the same thing from Discord chat. `!status` shows pending say files.
 
-**Voice mode (agent behavior):** when enabled, the agent splits turns like a call with screen-share — human summaries, status, questions, and completion notices go to voice (one short say-queue drop per turn, plain conversational language, no code/paths/URLs); all technical content (code, diffs, logs, exact commands, paths) stays in text chat. Toggle: say `voice mode on/off`, backed by the flag file `.opencode/voice-mode.on` (presence = on). The flag is local-only and gitignored, so it never leaks into clones — but any agent session in this repo (including the bot's own opencode backend, which discovers the `discord-voice` skill) honors it. Defined in full in `.opencode/skills/discord-voice/SKILL.md`.
+**Voice mode (agent behavior):** when enabled, the agent splits turns like a call with screen-share — human summaries, status, questions, and completion notices go to voice (one short say-queue drop per turn, plain conversational language, no code/paths/URLs); all technical content (code, diffs, logs, exact commands, paths) stays in text chat. Before any action likely to raise a permission/approval gate, it speaks a one-line heads-up first (the gate itself still appears in text as normal). Toggle: say `voice mode on/off`, backed by the flag file `.opencode/voice-mode.on` (presence = on). The flag is local-only and gitignored, so it never leaks into clones — but any agent session in this repo (including the bot's own opencode backend, which discovers the `discord-voice` skill) honors it. Defined in full in `.opencode/skills/discord-voice/SKILL.md`.
 
 Prerequisites: Voicebox running with a `Computer` (or your) profile and a Whisper model downloaded (first `/transcribe` may return 202 while it downloads — the bot treats that as "transcription unavailable" and falls back to `--file`). VC playback additionally needs `ffmpeg` on PATH and Opus (`pip install -r requirements.txt` covers `PyNaCl`/`davey`; the Windows Opus DLL is auto-loaded from next to `bot.py`, override with `OPUS_LIB`). There is no live VC *listening* — `discord.py` can't receive audio; voice notes are the input path.
 
@@ -165,5 +167,6 @@ With `DEFAULT_DISCORD_CHANNEL` set in `.env`, omit `--to`. Targets: `#name`, `<c
 - **Operational chatter**: agent/session notices ("Switched agent to Build") are filtered from chat. If a future opencode schema produces zero known chat events, the bot falls back to a greedy extract and logs a warning — noise over silence, and the warning says so.
 - **No reply at all**: check stderr logs (`[dm:...]` / `[guild:...]` lines), verify Message Content intent is on, and that your user id is in `ALLOWED_USER_IDS` (anyone else is silently ignored).
 - **Voice note came back as a file reference, not a transcript**: Voicebox was unreachable, still downloading the Whisper model (first run), or Whisper returned empty twice. The bot falls back to `--file` so nothing is lost — check the bot log for `voicebox STT` lines and retry.
-- **No spoken reply**: `!voice off` mutes TTS per chat (`!status` shows it); empty `VOICEBOX_URL` disables voice globally; TTS failure only ever drops the audio, text always posts.
+- **No spoken reply**: `!voice off` mutes TTS per chat (`!status` shows it); empty `VOICEBOX_URL` disables voice globally; TTS failure only ever drops the audio, text always posts. Run `!voiceready` — it pinpoints which side is down.
+- **First reply after idle is slow**: cold Voicebox model load costs ~25s once; the bot sends a silent warmup TTS at startup (`VOICEBOX_WARMUP`, watch for `voice warmup:` in the log). Manually unloading the model in Voicebox UI re-cools it.
 - **`!join` says Opus isn't loaded**: the bot needs `libopus-0.x64.dll` next to `bot.py` (or set `OPUS_LIB`), plus `ffmpeg` on PATH. The startup log says which opus path it loaded.
