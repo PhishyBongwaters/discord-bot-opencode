@@ -2452,6 +2452,465 @@ async def sessions_cmd(interaction: discord.Interaction):
         view=SessionPicker(key, options, titles), ephemeral=True)
 
 
+class _NullTyping:
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *exc):
+        return False
+
+
+class _SlashChannel:
+    """Presents channel.send/typing to handle_text_command; sends go to
+    an ephemeral slash followup instead of the public channel."""
+
+    def __init__(self, interaction):
+        self._interaction = interaction
+
+    async def send(self, content):
+        await self._interaction.followup.send(content, ephemeral=True)
+
+    def typing(self):
+        # slash commands defer up front ("thinking"); typing is a no-op
+        return _NullTyping()
+
+
+class _SlashMessage:
+    """Adapts an interaction to the message shape handle_text_command
+    expects (author/channel/guild/attachments)."""
+
+    def __init__(self, interaction):
+        self.author = interaction.user
+        self.channel = _SlashChannel(interaction)
+        self.guild = interaction.guild
+        self.attachments = []
+
+
+async def _run_slash(interaction, text):
+    """Shared slash entry: defer ephemeral, then run the !-equivalent
+    text through handle_text_command (same behavior, ephemeral replies)."""
+    await interaction.response.defer(ephemeral=True)
+    msg = _SlashMessage(interaction)
+    key = key_for_interaction(interaction)
+    await handle_text_command(msg, text, key)
+
+
+@tree.command(name="new", description="Start a fresh opencode session")
+async def new_cmd(interaction: discord.Interaction):
+    await _run_slash(interaction, "!new")
+
+
+@tree.command(name="status",
+              description="Session, usage, inbox, queue and voice status")
+async def status_cmd(interaction: discord.Interaction):
+    await _run_slash(interaction, "!status")
+
+
+@tree.command(name="voice", description="Spoken replies on/off for this chat")
+@app_commands.describe(state="on or off")
+@app_commands.choices(state=[
+    app_commands.Choice(name="on", value="on"),
+    app_commands.Choice(name="off", value="off"),
+])
+async def voice_cmd(interaction: discord.Interaction, state: str):
+    await _run_slash(interaction, f"!voice {state}")
+
+
+@tree.command(name="voiceprofile",
+              description="This chat's Voicebox voice profile")
+@app_commands.describe(profile="profile name or id, or 'clear' to reset")
+async def voiceprofile_cmd(interaction: discord.Interaction, profile: str):
+    await _run_slash(interaction, f"!voiceprofile {profile}")
+
+
+@tree.command(name="join", description="Pull the bot into your voice channel")
+async def join_cmd(interaction: discord.Interaction):
+    await _run_slash(interaction, "!join")
+
+
+@tree.command(name="leave", description="Disconnect the bot from voice")
+async def leave_cmd(interaction: discord.Interaction):
+    await _run_slash(interaction, "!leave")
+
+
+@tree.command(name="say", description="Speak a line in the voice channel now")
+@app_commands.describe(text="the line to speak")
+async def say_cmd(interaction: discord.Interaction, text: str):
+    await _run_slash(interaction, f"!say {text}")
+
+
+@tree.command(name="voiceready",
+              description="Check voicebox + discord + VC readiness")
+async def voiceready_cmd(interaction: discord.Interaction):
+    await _run_slash(interaction, "!voiceready")
+
+
+@tree.command(name="cancel",
+              description="Stop the running opencode turn for this chat")
+async def cancel_cmd(interaction: discord.Interaction):
+    await _run_slash(interaction, "!cancel")
+
+
+@tree.command(name="skip",
+              description="Stop the current VC clip and drop the queue")
+async def skip_cmd(interaction: discord.Interaction):
+    await _run_slash(interaction, "!skip")
+
+
+@tree.command(name="help", description="Show bot help")
+async def help_cmd(interaction: discord.Interaction):
+    await _run_slash(interaction, "!help")
+
+
+async def handle_text_command(message, content, key):
+    """Run one !-style text command. True when a branch handled it.
+
+    Shared by the ! surface (on_message) and the / surface: each slash
+    command synthesizes the equivalent "!..." text and runs it here, so
+    behavior is identical and replies just route differently (see
+    _SlashMessage).
+    """
+    if content.lower() in ("!help", "help"):
+        extra = (f"\n(psst: you attached {len(message.attachments)} file(s) - "
+                 "resend them with your actual message.)"
+                 if message.attachments else "")
+        await message.channel.send(
+            "DM me anything and I'll run it through opencode.\n"
+            "`!new` - fresh session (plain message, not /new)\n"
+            "`!status` - session, usage, inbox, queue\n"
+            "`!voice [on|off]` - spoken replies via Voicebox (Computer voice)\n"
+            "`!voiceprofile [name-or-id|clear]` - per-chat voice profile\n"
+            "`!join` / `!leave` - speak replies in your voice channel (servers)\n"
+            "`!say <text>` - speak a line in VC now, no opencode call\n"
+            "`!skip` - stop the current VC clip and drop the queue "
+            "(stays connected)\n"
+            "`!voiceready` - check voicebox + discord + VC + you-in-VC\n"
+            "`!cancel` - stop the running turn (kills this run; send again "
+            "if a follow-up started)\n"
+            f"`{GUILD_PREFIX} <prompt>` - use me in a server channel\n"
+            "Attach + `place this in <dir>` saves files directly.\n"
+            "`send me <path>` sends a file back directly.\n"
+            "Rapid messages merge into one follow-up - wait for the check.\n"
+            "`/sessions` - browse and switch opencode sessions (servers).\n"
+            "`/model` - switch the model for this chat.\n"
+            "Slash equivalents (ephemeral replies): `/new` `/status`\n"
+            "`/voice` `/voiceprofile` `/join` `/leave` `/say` `/voiceready`\n"
+            "`/cancel` `/skip` `/help` - same behavior as the `!` forms.\n"
+            "DJ+ only: `!say` `!model` `!join` `!leave` `!skip` `!cancel`\n"
+            "`!voice` `!voiceprofile` `!voiceready` `!new`, file drop/send.\n"
+            "Plain chat, `!status`, `!help`: everyone allowed."
+            + extra)
+        return True
+
+    if content.lower() == "!cancel":
+        if not await require_tier(message, TIER_DJ, "!cancel"):
+            return True
+        await cancel_turn(key, message.channel)
+        return True
+
+    if content.lower() == "!new":
+        if not await require_tier(message, TIER_DJ, "!new"):
+            return True
+        SESSIONS.pop(key, None)
+        USAGE.pop(key, None)
+        save_state()
+        extra = (f" ({len(message.attachments)} attached file(s) ignored - "
+                 "resend them now.)" if message.attachments else "")
+        await message.channel.send("fresh opencode session started." + extra)
+        return True
+
+    if content.lower() == "!status":
+        sid = SESSIONS.get(key, "(none)")
+        u = USAGE.get(key, {"in": 0, "out": 0, "cost": 0.0, "turns": 0})
+        try:
+            inbox = ATTACH_DIR / safe_key(key)
+            nfiles = nbytes = 0
+            for p in inbox.iterdir():
+                if p.is_file():
+                    nfiles += 1
+                    nbytes += p.stat().st_size
+            inbox_s = f"{nfiles} file(s), {nbytes / 1024 / 1024:.1f} MB"
+        except OSError:
+            inbox_s = "n/a"
+        q = get_queue(key)
+        queue_s = (f"running + {len(q.buffer)} pending" if q.running
+                   else "idle")
+        if MAX_CONCURRENT_TURNS > 0:
+            async with TURN_GATE_GUARD:
+                _run_n = TURN_SLOTS_HELD
+                _wait_n = len(TURN_WAITERS)
+            gate_s = f" | global: {_run_n} running, {_wait_n} waiting"
+        else:
+            async with ACTIVE_GUARD:
+                _active_n = ACTIVE_TURNS
+            gate_s = f" | global: {_active_n} running (unlimited)"
+        model = MODEL_OVERRIDES.get(key)
+        model_s = model if model else (
+            f"{OPENCODE_MODEL} (env)" if OPENCODE_MODEL else "opencode default")
+        voice_s = (f"on ({effective_voice_profile(key)})" if voice_enabled(key)
+                   else "off")
+        guild = getattr(message, "guild", None)
+        gvc = guild.voice_client if guild is not None else None
+        if gvc is not None and gvc.is_connected():
+            pending = (VC_QUEUES.get(guild.id).qsize()
+                       if VC_QUEUES.get(guild.id) else 0)
+            auto = ""
+            deadline = VC_AUTOLEAVE_AT.get(guild.id)
+            if deadline is not None:
+                rem = deadline - time.monotonic()
+                if rem > 0:
+                    auto = (f", auto-leave in {int(rem // 60)}m"
+                            f"{int(rem % 60):02d}s")
+            vc_s = (f"in #{gvc.channel.name} "
+                    f"({'speaking' if gvc.is_playing() else 'idle'}"
+                    f"{f', {pending} queued' if pending else ''}{auto})"
+                    if gvc.channel else "connected")
+        else:
+            vc_s = "not connected (`!join` in a server)"
+        try:
+            pending_say = sum(
+                1 for p in SAY_DIR.iterdir()
+                if p.is_file() and p.suffix.lower() == ".txt"
+                and not p.name.startswith(".")) if SAY_DIR_ENABLED else 0
+        except OSError:
+            pending_say = 0
+        await message.channel.send(
+            f"session `{sid}`\n"
+            f"model: `{model_s}`\n"
+            f"voice: `{voice_s}`\n"
+            f"vc: `{vc_s}`\n"
+            f"say-queue: `{pending_say} pending`\n"
+            f"turns: {u['turns']} | tokens: {u['in']} in / {u['out']} out | "
+            f"cost: ${u['cost']:.4f}\n"
+            f"inbox: {inbox_s}\n"
+            f"queue: {queue_s}{gate_s}")
+        return True
+
+    if content.lower() == "!voice" or content.lower().startswith("!voice "):
+        if not await require_tier(message, TIER_DJ, "!voice"):
+            return True
+        arg = content[6:].strip().lower()
+        if arg in ("on", "off"):
+            VOICE_OVERRIDES[key] = (arg == "on")
+            save_state()
+            log.info("[%s] voice override: %s", key, arg)
+            await message.channel.send(
+                f"voice replies {arg} for this chat.")
+        else:
+            state = "on" if voice_enabled(key) else "off"
+            await message.channel.send(
+                f"voice replies: `{state}` "
+                f"(profile `{effective_voice_profile(key)}`). "
+                "`!voice on` / `!voice off` to change.")
+        return True
+
+    if content.lower() == "!voiceprofile" or content.lower().startswith(
+            "!voiceprofile "):
+        if not await require_tier(message, TIER_DJ, "!voiceprofile"):
+            return True
+        arg = content[len("!voiceprofile"):].strip()
+        if not arg:
+            cur = VOICE_PROFILE_OVERRIDES.get(key)
+            await message.channel.send(
+                "voice profile for this chat: "
+                f"`{cur or VOICEBOX_PROFILE + ' (global)'}`. "
+                "`!voiceprofile <name-or-id>` to change, "
+                "`!voiceprofile clear` to reset.")
+            return True
+        if arg.lower() == "clear":
+            VOICE_PROFILE_OVERRIDES.pop(key, None)
+            save_state()
+            log.info("[%s] voice profile override cleared", key)
+            await message.channel.send(
+                "voice profile cleared - back to global "
+                f"`{VOICEBOX_PROFILE}`.")
+            return True
+        pid = await asyncio.to_thread(_resolve_profile_name, arg)
+        if pid is None:
+            items = await asyncio.to_thread(list_voicebox_profiles)
+            names = ", ".join(f"`{n}`" for _, n in items if n)
+            await message.channel.send(
+                f"unknown voice profile `{arg}` - available: "
+                f"{names or '(none found)'}.")
+            return True
+        VOICE_PROFILE_OVERRIDES[key] = arg
+        save_state()
+        log.info("[%s] voice profile override: %s", key, arg)
+        await message.channel.send(
+            f"voice profile for this chat: `{arg}`.")
+        return True
+
+    if content.lower() == "!join":
+        if not await require_tier(message, TIER_DJ, "!join"):
+            return True
+        guild = getattr(message, "guild", None)
+        if guild is None:
+            await message.channel.send(
+                "voice channels only exist in servers - `!join` works in a "
+                "server channel, not DMs.")
+            return True
+        vs = getattr(message.author, "voice", None)
+        target = vs.channel if vs else None
+        if target is None:
+            await message.channel.send(
+                "join a voice channel first, then `!join` to pull me in.")
+            return True
+        if not ensure_opus():
+            await message.channel.send(
+                "voice audio library (Opus) isn't loaded - check the bot log "
+                "for the opus path it tried.")
+            return True
+        try:
+            vc = guild.voice_client
+            if vc is not None and vc.is_connected():
+                if vc.channel is not None and vc.channel.id == target.id:
+                    await message.channel.send(
+                        f"already in `{target.name}` - replies are spoken there.")
+                else:
+                    await vc.move_to(target)
+                    log.info("[%s] VC moved to %s", key, target.name)
+                    await message.channel.send(
+                        f"moved to `{target.name}` - replies are spoken there.")
+            else:
+                await target.connect()
+                log.info("[%s] VC joined %s", key, target.name)
+                await message.channel.send(
+                    f"joined `{target.name}` - replies are spoken there, "
+                    "no file to click.")
+        except Exception as e:
+            log.exception("[%s] VC join failed", key)
+            await message.channel.send(f"could not join `{target.name}`: {e}")
+        _refresh_autoleave(guild.id)
+        return True
+
+    if content.lower() in ("!leave", "!disconnect", "!stop"):
+        if not await require_tier(message, TIER_DJ, "!leave"):
+            return True
+        guild = getattr(message, "guild", None)
+        vc = guild.voice_client if guild is not None else None
+        if vc is None or not vc.is_connected():
+            await message.channel.send("not in a voice channel.")
+            return True
+        try:
+            name = vc.channel.name if vc.channel else "voice"
+            VC_EXPECTED_BYE.add(guild.id)
+            vc_drop(guild.id)
+            try:
+                vc.stop()
+            except Exception:
+                pass
+            await vc.disconnect()
+            log.info("[%s] VC left %s", key, name)
+            await message.channel.send(
+                f"left `{name}` - back to reply.wav files.")
+        except Exception as e:
+            log.exception("[%s] VC leave failed", key)
+            await message.channel.send(f"could not leave: {e}")
+        return True
+
+    if content.lower() == "!skip":
+        if not await require_tier(message, TIER_DJ, "!skip"):
+            return True
+        guild = getattr(message, "guild", None)
+        vc = guild.voice_client if guild is not None else None
+        if vc is None or not vc.is_connected():
+            await message.channel.send("not in a voice channel.")
+            return True
+        gid = guild.id
+        VC_EPOCHS[gid] = VC_EPOCHS.get(gid, 0) + 1
+        try:
+            was_playing = bool(vc.is_playing())
+        except Exception:
+            was_playing = False
+        q = VC_QUEUES.get(gid)
+        pending = q.qsize() if q is not None else 0
+        streaming = VC_STREAMS.get(gid, 0) > 0
+        try:
+            vc.stop()
+        except Exception:
+            pass
+        vc_drop(gid)
+        log.info("[%s] VC skip: stopped=%s dropped=%d", key,
+                 was_playing, pending)
+        if was_playing or pending or streaming:
+            extra = f" ({pending} queued dropped)" if pending else ""
+            await message.channel.send(f"skipped.{extra}")
+        else:
+            await message.channel.send("nothing playing.")
+        return True
+
+    if content.lower() == "!say" or content.lower().startswith("!say "):
+        if not await require_tier(message, TIER_DJ, "!say"):
+            return True
+        line = content[4:].strip()
+        if not line:
+            await message.channel.send(
+                "usage: `!say <text>` - speaks in every connected voice "
+                "channel, no opencode call.")
+            return True
+        live = connected_guild_ids()
+        if not live:
+            await message.channel.send(
+                "not in any voice channel - `!join` first.")
+            return True
+        async with message.channel.typing():
+            wav = await asyncio.to_thread(tts_wav, line, key)
+        if not wav:
+            await message.channel.send("TTS failed - check the bot log.")
+            return True
+        VC_TMP.mkdir(parents=True, exist_ok=True)
+        n = 0
+        for gid in live:
+            if await vc_say(gid, wav, VC_TMP):
+                n += 1
+        log.info("[%s] !say queued for %d guild(s): %r", key, n, line[:80])
+        await message.channel.send(
+            f"saying it in {n} voice channel(s).")
+        return True
+
+    if content.lower() == "!voiceready":
+        if not await require_tier(message, TIER_DJ, "!voiceready"):
+            return True
+        results = await voice_ready()
+        lines = []
+        for label, ok, detail in results:
+            lines.append(f"{'OK ' if ok else 'FAIL'} `{label}`: {detail}")
+        allok = all(ok for _, ok, _ in results)
+        lines.append("voice ready." if allok else
+                     "NOT voice ready - fix the FAIL lines above.")
+        log.info("[%s] voiceready: %s",
+                 key, "; ".join(f"{l}={o}" for l, o, _ in results))
+        await message.channel.send("\n".join(lines))
+        return True
+
+    if content.lower() == "!model" or content.lower().startswith("!model "):
+        if not await require_tier(message, TIER_DJ, "!model"):
+            return True
+        arg = content[6:].strip()
+        items = await asyncio.to_thread(get_models)
+        action, value = resolve_model_arg(arg, items)
+        if action == "show":
+            lines = [f"current: `{current_model_s(key)}`"]
+            if items:
+                lines += [f"- `{m}`" for m in items]
+            else:
+                lines.append("(model list unavailable)")
+            for part in split_smart("\n".join(lines), MAX_DISCORD):
+                await message.channel.send(part)
+        elif action == "clear":
+            MODEL_OVERRIDES.pop(key, None)
+            save_state()
+            await message.channel.send("model cleared - back to default.")
+        elif action == "set":
+            MODEL_OVERRIDES[key] = value
+            save_state()
+            log.info("[%s] model override via !model: %s", key, value)
+            await message.channel.send(f"model for this chat: `{value}`.")
+        else:
+            await message.channel.send(value)
+        return True
+    return False
+
 @client.event
 async def on_ready():
     log.info("logged in as %s (id %s)", client.user, client.user.id)
@@ -2529,342 +2988,8 @@ async def on_message(message):
     if not content and not message.attachments:
         return
 
-    if content.lower() in ("!help", "help"):
-        extra = (f"\n(psst: you attached {len(message.attachments)} file(s) - "
-                 "resend them with your actual message.)"
-                 if message.attachments else "")
-        await message.channel.send(
-            "DM me anything and I'll run it through opencode.\n"
-            "`!new` - fresh session (plain message, not /new)\n"
-            "`!status` - session, usage, inbox, queue\n"
-            "`!voice [on|off]` - spoken replies via Voicebox (Computer voice)\n"
-            "`!voiceprofile [name-or-id|clear]` - per-chat voice profile\n"
-            "`!join` / `!leave` - speak replies in your voice channel (servers)\n"
-            "`!say <text>` - speak a line in VC now, no opencode call\n"
-            "`!skip` - stop the current VC clip and drop the queue "
-            "(stays connected)\n"
-            "`!voiceready` - check voicebox + discord + VC + you-in-VC\n"
-            "`!cancel` - stop the running turn (kills this run; send again "
-            "if a follow-up started)\n"
-            f"`{GUILD_PREFIX} <prompt>` - use me in a server channel\n"
-            "Attach + `place this in <dir>` saves files directly.\n"
-            "`send me <path>` sends a file back directly.\n"
-            "Rapid messages merge into one follow-up - wait for the check.\n"
-            "`/sessions` - browse and switch opencode sessions (servers).\n"
-            "`/model` - switch the model for this chat.\n"
-            "DJ+ only: `!say` `!model` `!join` `!leave` `!skip` `!cancel`\n"
-            "`!voice` `!voiceprofile` `!voiceready` `!new`, file drop/send.\n"
-            "Plain chat, `!status`, `!help`: everyone allowed."
-            + extra)
-        return
-
     key = session_key_for(message)
-    if content.lower() == "!cancel":
-        if not await require_tier(message, TIER_DJ, "!cancel"):
-            return
-        await cancel_turn(key, message.channel)
-        return
-
-    if content.lower() == "!new":
-        if not await require_tier(message, TIER_DJ, "!new"):
-            return
-        SESSIONS.pop(key, None)
-        USAGE.pop(key, None)
-        save_state()
-        extra = (f" ({len(message.attachments)} attached file(s) ignored - "
-                 "resend them now.)" if message.attachments else "")
-        await message.channel.send("fresh opencode session started." + extra)
-        return
-
-    if content.lower() == "!status":
-        sid = SESSIONS.get(key, "(none)")
-        u = USAGE.get(key, {"in": 0, "out": 0, "cost": 0.0, "turns": 0})
-        try:
-            inbox = ATTACH_DIR / safe_key(key)
-            nfiles = nbytes = 0
-            for p in inbox.iterdir():
-                if p.is_file():
-                    nfiles += 1
-                    nbytes += p.stat().st_size
-            inbox_s = f"{nfiles} file(s), {nbytes / 1024 / 1024:.1f} MB"
-        except OSError:
-            inbox_s = "n/a"
-        q = get_queue(key)
-        queue_s = (f"running + {len(q.buffer)} pending" if q.running
-                   else "idle")
-        if MAX_CONCURRENT_TURNS > 0:
-            async with TURN_GATE_GUARD:
-                _run_n = TURN_SLOTS_HELD
-                _wait_n = len(TURN_WAITERS)
-            gate_s = f" | global: {_run_n} running, {_wait_n} waiting"
-        else:
-            async with ACTIVE_GUARD:
-                _active_n = ACTIVE_TURNS
-            gate_s = f" | global: {_active_n} running (unlimited)"
-        model = MODEL_OVERRIDES.get(key)
-        model_s = model if model else (
-            f"{OPENCODE_MODEL} (env)" if OPENCODE_MODEL else "opencode default")
-        voice_s = (f"on ({effective_voice_profile(key)})" if voice_enabled(key)
-                   else "off")
-        guild = getattr(message, "guild", None)
-        gvc = guild.voice_client if guild is not None else None
-        if gvc is not None and gvc.is_connected():
-            pending = (VC_QUEUES.get(guild.id).qsize()
-                       if VC_QUEUES.get(guild.id) else 0)
-            auto = ""
-            deadline = VC_AUTOLEAVE_AT.get(guild.id)
-            if deadline is not None:
-                rem = deadline - time.monotonic()
-                if rem > 0:
-                    auto = (f", auto-leave in {int(rem // 60)}m"
-                            f"{int(rem % 60):02d}s")
-            vc_s = (f"in #{gvc.channel.name} "
-                    f"({'speaking' if gvc.is_playing() else 'idle'}"
-                    f"{f', {pending} queued' if pending else ''}{auto})"
-                    if gvc.channel else "connected")
-        else:
-            vc_s = "not connected (`!join` in a server)"
-        try:
-            pending_say = sum(
-                1 for p in SAY_DIR.iterdir()
-                if p.is_file() and p.suffix.lower() == ".txt"
-                and not p.name.startswith(".")) if SAY_DIR_ENABLED else 0
-        except OSError:
-            pending_say = 0
-        await message.channel.send(
-            f"session `{sid}`\n"
-            f"model: `{model_s}`\n"
-            f"voice: `{voice_s}`\n"
-            f"vc: `{vc_s}`\n"
-            f"say-queue: `{pending_say} pending`\n"
-            f"turns: {u['turns']} | tokens: {u['in']} in / {u['out']} out | "
-            f"cost: ${u['cost']:.4f}\n"
-            f"inbox: {inbox_s}\n"
-            f"queue: {queue_s}{gate_s}")
-        return
-
-    if content.lower() == "!voice" or content.lower().startswith("!voice "):
-        if not await require_tier(message, TIER_DJ, "!voice"):
-            return
-        arg = content[6:].strip().lower()
-        if arg in ("on", "off"):
-            VOICE_OVERRIDES[key] = (arg == "on")
-            save_state()
-            log.info("[%s] voice override: %s", key, arg)
-            await message.channel.send(
-                f"voice replies {arg} for this chat.")
-        else:
-            state = "on" if voice_enabled(key) else "off"
-            await message.channel.send(
-                f"voice replies: `{state}` "
-                f"(profile `{effective_voice_profile(key)}`). "
-                "`!voice on` / `!voice off` to change.")
-        return
-
-    if content.lower() == "!voiceprofile" or content.lower().startswith(
-            "!voiceprofile "):
-        if not await require_tier(message, TIER_DJ, "!voiceprofile"):
-            return
-        arg = content[len("!voiceprofile"):].strip()
-        if not arg:
-            cur = VOICE_PROFILE_OVERRIDES.get(key)
-            await message.channel.send(
-                "voice profile for this chat: "
-                f"`{cur or VOICEBOX_PROFILE + ' (global)'}`. "
-                "`!voiceprofile <name-or-id>` to change, "
-                "`!voiceprofile clear` to reset.")
-            return
-        if arg.lower() == "clear":
-            VOICE_PROFILE_OVERRIDES.pop(key, None)
-            save_state()
-            log.info("[%s] voice profile override cleared", key)
-            await message.channel.send(
-                "voice profile cleared - back to global "
-                f"`{VOICEBOX_PROFILE}`.")
-            return
-        pid = await asyncio.to_thread(_resolve_profile_name, arg)
-        if pid is None:
-            items = await asyncio.to_thread(list_voicebox_profiles)
-            names = ", ".join(f"`{n}`" for _, n in items if n)
-            await message.channel.send(
-                f"unknown voice profile `{arg}` - available: "
-                f"{names or '(none found)'}.")
-            return
-        VOICE_PROFILE_OVERRIDES[key] = arg
-        save_state()
-        log.info("[%s] voice profile override: %s", key, arg)
-        await message.channel.send(
-            f"voice profile for this chat: `{arg}`.")
-        return
-
-    if content.lower() == "!join":
-        if not await require_tier(message, TIER_DJ, "!join"):
-            return
-        guild = getattr(message, "guild", None)
-        if guild is None:
-            await message.channel.send(
-                "voice channels only exist in servers - `!join` works in a "
-                "server channel, not DMs.")
-            return
-        vs = getattr(message.author, "voice", None)
-        target = vs.channel if vs else None
-        if target is None:
-            await message.channel.send(
-                "join a voice channel first, then `!join` to pull me in.")
-            return
-        if not ensure_opus():
-            await message.channel.send(
-                "voice audio library (Opus) isn't loaded - check the bot log "
-                "for the opus path it tried.")
-            return
-        try:
-            vc = guild.voice_client
-            if vc is not None and vc.is_connected():
-                if vc.channel is not None and vc.channel.id == target.id:
-                    await message.channel.send(
-                        f"already in `{target.name}` - replies are spoken there.")
-                else:
-                    await vc.move_to(target)
-                    log.info("[%s] VC moved to %s", key, target.name)
-                    await message.channel.send(
-                        f"moved to `{target.name}` - replies are spoken there.")
-            else:
-                await target.connect()
-                log.info("[%s] VC joined %s", key, target.name)
-                await message.channel.send(
-                    f"joined `{target.name}` - replies are spoken there, "
-                    "no file to click.")
-        except Exception as e:
-            log.exception("[%s] VC join failed", key)
-            await message.channel.send(f"could not join `{target.name}`: {e}")
-        _refresh_autoleave(guild.id)
-        return
-
-    if content.lower() in ("!leave", "!disconnect", "!stop"):
-        if not await require_tier(message, TIER_DJ, "!leave"):
-            return
-        guild = getattr(message, "guild", None)
-        vc = guild.voice_client if guild is not None else None
-        if vc is None or not vc.is_connected():
-            await message.channel.send("not in a voice channel.")
-            return
-        try:
-            name = vc.channel.name if vc.channel else "voice"
-            VC_EXPECTED_BYE.add(guild.id)
-            vc_drop(guild.id)
-            try:
-                vc.stop()
-            except Exception:
-                pass
-            await vc.disconnect()
-            log.info("[%s] VC left %s", key, name)
-            await message.channel.send(
-                f"left `{name}` - back to reply.wav files.")
-        except Exception as e:
-            log.exception("[%s] VC leave failed", key)
-            await message.channel.send(f"could not leave: {e}")
-        return
-
-    if content.lower() == "!skip":
-        if not await require_tier(message, TIER_DJ, "!skip"):
-            return
-        guild = getattr(message, "guild", None)
-        vc = guild.voice_client if guild is not None else None
-        if vc is None or not vc.is_connected():
-            await message.channel.send("not in a voice channel.")
-            return
-        gid = guild.id
-        VC_EPOCHS[gid] = VC_EPOCHS.get(gid, 0) + 1
-        try:
-            was_playing = bool(vc.is_playing())
-        except Exception:
-            was_playing = False
-        q = VC_QUEUES.get(gid)
-        pending = q.qsize() if q is not None else 0
-        streaming = VC_STREAMS.get(gid, 0) > 0
-        try:
-            vc.stop()
-        except Exception:
-            pass
-        vc_drop(gid)
-        log.info("[%s] VC skip: stopped=%s dropped=%d", key,
-                 was_playing, pending)
-        if was_playing or pending or streaming:
-            extra = f" ({pending} queued dropped)" if pending else ""
-            await message.channel.send(f"skipped.{extra}")
-        else:
-            await message.channel.send("nothing playing.")
-        return
-
-    if content.lower() == "!say" or content.lower().startswith("!say "):
-        if not await require_tier(message, TIER_DJ, "!say"):
-            return
-        line = content[4:].strip()
-        if not line:
-            await message.channel.send(
-                "usage: `!say <text>` - speaks in every connected voice "
-                "channel, no opencode call.")
-            return
-        live = connected_guild_ids()
-        if not live:
-            await message.channel.send(
-                "not in any voice channel - `!join` first.")
-            return
-        async with message.channel.typing():
-            wav = await asyncio.to_thread(tts_wav, line, key)
-        if not wav:
-            await message.channel.send("TTS failed - check the bot log.")
-            return
-        VC_TMP.mkdir(parents=True, exist_ok=True)
-        n = 0
-        for gid in live:
-            if await vc_say(gid, wav, VC_TMP):
-                n += 1
-        log.info("[%s] !say queued for %d guild(s): %r", key, n, line[:80])
-        await message.channel.send(
-            f"saying it in {n} voice channel(s).")
-        return
-
-    if content.lower() == "!voiceready":
-        if not await require_tier(message, TIER_DJ, "!voiceready"):
-            return
-        results = await voice_ready()
-        lines = []
-        for label, ok, detail in results:
-            lines.append(f"{'OK ' if ok else 'FAIL'} `{label}`: {detail}")
-        allok = all(ok for _, ok, _ in results)
-        lines.append("voice ready." if allok else
-                     "NOT voice ready - fix the FAIL lines above.")
-        log.info("[%s] voiceready: %s",
-                 key, "; ".join(f"{l}={o}" for l, o, _ in results))
-        await message.channel.send("\n".join(lines))
-        return
-
-    if content.lower() == "!model" or content.lower().startswith("!model "):
-        if not await require_tier(message, TIER_DJ, "!model"):
-            return
-        arg = content[6:].strip()
-        items = await asyncio.to_thread(get_models)
-        action, value = resolve_model_arg(arg, items)
-        if action == "show":
-            lines = [f"current: `{current_model_s(key)}`"]
-            if items:
-                lines += [f"- `{m}`" for m in items]
-            else:
-                lines.append("(model list unavailable)")
-            for part in split_smart("\n".join(lines), MAX_DISCORD):
-                await message.channel.send(part)
-        elif action == "clear":
-            MODEL_OVERRIDES.pop(key, None)
-            save_state()
-            await message.channel.send("model cleared - back to default.")
-        elif action == "set":
-            MODEL_OVERRIDES[key] = value
-            save_state()
-            log.info("[%s] model override via !model: %s", key, value)
-            await message.channel.send(f"model for this chat: `{value}`.")
-        else:
-            await message.channel.send(value)
+    if await handle_text_command(message, content, key):
         return
 
     log.info("[%s] msg from %s (%d attach, %d chars): %r",
