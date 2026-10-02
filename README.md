@@ -81,6 +81,7 @@ Two-way chat between Discord and opencode. DM the bot, it forwards to `opencode 
 | `SAY_MAX_BYTES` | `8192` | Largest say file accepted (bigger is skipped) |
 | `VC_AUTOJOIN` | empty (= disabled) | Voice channel id to join on startup and sit in until restart |
 | `VC_AUTOREJOIN` | `1` | `1` = rejoin the autojoin channel if disconnected unexpectedly (`!leave` still sticks) |
+| `VOICEBOX_WARMUP` | `1` | `1` = one silent TTS at startup so the first real reply skips model-load cost |
 
 `sample.env` shows the same knobs.
 

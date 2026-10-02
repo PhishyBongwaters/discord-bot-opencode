@@ -60,6 +60,8 @@ Config via env (or .env in cwd / ~/.config/opencode-discord/):
     VC_AUTOJOIN         voice channel id to join on startup (empty disables)
     VC_AUTOREJOIN       "1" = rejoin the autojoin channel if disconnected
                         unexpectedly (default "1"; `!leave` still sticks)
+    VOICEBOX_WARMUP     "1" = one silent TTS at startup so the first real reply
+                        doesn't pay model-load cost (default "1")
 
     Voice channels (guilds only, text stays the input):
     `!join` pulls the bot into your current voice channel; every voice-enabled
@@ -174,6 +176,7 @@ SAY_POLL = _env_float("SAY_POLL", 2.0) or 2.0
 SAY_MAX_BYTES = _env_int("SAY_MAX_BYTES", 8192)
 VC_AUTOJOIN = os.environ.get("VC_AUTOJOIN", "").strip()
 VC_AUTOREJOIN = os.environ.get("VC_AUTOREJOIN", "1") == "1"
+VOICEBOX_WARMUP = os.environ.get("VOICEBOX_WARMUP", "1") == "1"
 
 logging.basicConfig(
     level=getattr(logging, LOG_LEVEL, logging.INFO),
@@ -1102,6 +1105,19 @@ async def autojoin_vc():
         log.warning("VC_AUTOJOIN join failed: %s", e)
 
 
+async def warmup_voice():
+    """One silent TTS so the first real reply skips model-load cost."""
+    if not VOICEBOX_WARMUP or not VOICEBOX_URL:
+        return
+    t0 = time.monotonic()
+    wav = await asyncio.to_thread(tts_wav_clean, "Voice ready.")
+    dt = time.monotonic() - t0
+    if wav:
+        log.info("voice warmup: %d bytes in %.1fs", len(wav), dt)
+    else:
+        log.warning("voice warmup failed - first reply will pay load cost")
+
+
 async def autorejoin_vc(guild_id, delay=10):
     """Rejoin the autojoin channel after an unexpected disconnect."""
     await asyncio.sleep(delay)
@@ -1619,6 +1635,8 @@ async def on_ready():
         asyncio.ensure_future(say_watcher())
         log.info("say-queue watching %s", SAY_DIR)
     await autojoin_vc()
+    if VOICEBOX_WARMUP:
+        asyncio.ensure_future(warmup_voice())
     if not TREE_SYNCED:
         TREE_SYNCED = True
         for g in client.guilds:
