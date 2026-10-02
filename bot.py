@@ -21,6 +21,16 @@
 Config via env (or .env in cwd / ~/.config/opencode-discord/):
     DISCORD_BOT_TOKEN   required
     ALLOWED_USER_IDS    comma-separated Discord user ids; empty = anyone (warns)
+    DJ_USER_IDS         comma-separated user ids with the DJ tier (default empty)
+    DJ_ROLE_IDS         comma-separated Discord role ids with the DJ tier
+    ADMIN_USER_IDS      comma-separated user ids with the admin tier
+                        (default: ALLOWED_USER_IDS; empty ALLOWED with this
+                        unset = open mode, tiers disabled)
+    ADMIN_ROLE_IDS      comma-separated Discord role ids with the admin tier
+                        Tiers: admin > DJ > everyone. DJ+ commands: !say !model
+                        !join !leave !skip !cancel !voice !voiceprofile
+                        !voiceready !new, direct drop/send, /model /sessions.
+                        Plain chat, !status, !help: everyone allowed.
     OPENCODE_BIN        default "opencode"
     OPENCODE_DIR        working dir for opencode runs (default cwd)
     FILE_JAIL         allowlist root for drop targets + send sources
@@ -166,6 +176,76 @@ def _env_float(name, default):
 TOKEN = os.environ.get("DISCORD_BOT_TOKEN", "").strip()
 ALLOWED = {u.strip() for u in os.environ.get("ALLOWED_USER_IDS", "").split(",")
            if u.strip()}
+
+
+def _env_id_set(name):
+    return {u.strip() for u in os.environ.get(name, "").split(",")
+            if u.strip()}
+
+
+TIER_EVERYONE = 0
+TIER_DJ = 1
+TIER_ADMIN = 2
+
+# Role-based permissions (issue #5). ALLOWED_USER_IDS stays the outer
+# allow-list (empty = anyone, with the startup warning). Inside it:
+# admin (2) can do everything, DJ (1) can drive voice/model/session
+# commands, everyone (0) can plain-chat + !status + !help.
+# Defaults preserve single-operator behavior: with no role config, the
+# ALLOWED_USER_IDS set are admins. In open mode (ALLOWED empty) tiers
+# are disabled entirely (everyone admin) unless ADMIN_USER_IDS is set
+# explicitly — no surprise lockouts on upgrade either way.
+DJ_USER_IDS = _env_id_set("DJ_USER_IDS")
+DJ_ROLE_IDS = _env_id_set("DJ_ROLE_IDS")
+ADMIN_ROLE_IDS = _env_id_set("ADMIN_ROLE_IDS")
+if os.environ.get("ADMIN_USER_IDS", "").strip():
+    ADMIN_USER_IDS = _env_id_set("ADMIN_USER_IDS")
+elif ALLOWED:
+    ADMIN_USER_IDS = set(ALLOWED)
+else:
+    ADMIN_USER_IDS = None
+
+
+def role_tier(user_id, member=None):
+    """0 everyone / 1 DJ / 2 admin. Admin implies DJ. Never raises."""
+    uid = str(user_id or "")
+    roles = set()
+    if member is not None:
+        try:
+            roles = {str(r.id) for r in (member.roles or [])}
+        except Exception:
+            roles = set()
+    if ADMIN_USER_IDS is None:
+        return TIER_ADMIN  # open mode, no tiers configured
+    if uid in ADMIN_USER_IDS or (ADMIN_ROLE_IDS and roles & ADMIN_ROLE_IDS):
+        return TIER_ADMIN
+    if uid in DJ_USER_IDS or (DJ_ROLE_IDS and roles & DJ_ROLE_IDS):
+        return TIER_DJ
+    return TIER_EVERYONE
+
+
+def message_tier(message):
+    """Tier of a message's author (roles only exist on guild members)."""
+    author = getattr(message, "author", None)
+    member = author if author is not None and hasattr(author, "roles") \
+        else None
+    return role_tier(getattr(author, "id", None), member)
+
+
+async def require_tier(message, tier, what):
+    """True when the author meets the tier; else 'not permitted' reply."""
+    if message_tier(message) >= tier:
+        return True
+    need = "admin" if tier >= TIER_ADMIN else "DJ"
+    await message.channel.send(f"not permitted (`{what}` needs {need}+).")
+    return False
+
+
+def interaction_tier(interaction):
+    """Tier of a slash-command invoker."""
+    user = getattr(interaction, "user", None)
+    member = user if user is not None and hasattr(user, "roles") else None
+    return role_tier(getattr(user, "id", None), member)
 OPENCODE_BIN = os.environ.get("OPENCODE_BIN", "opencode")
 OPENCODE_DIR = os.environ.get("OPENCODE_DIR", os.getcwd())
 FILE_JAIL_RAW = os.environ.get("FILE_JAIL", "").strip()
@@ -2279,9 +2359,9 @@ async def model_autocomplete(interaction: discord.Interaction, current: str):
 @app_commands.describe(model="provider/model, or Default to clear")
 @app_commands.autocomplete(model=model_autocomplete)
 async def model_cmd(interaction: discord.Interaction, model: str):
-    if ALLOWED and str(interaction.user.id) not in ALLOWED:
+    if interaction_tier(interaction) < TIER_DJ:
         await interaction.response.send_message(
-            "not allowed.", ephemeral=True)
+            "not permitted (`/model` needs DJ+).", ephemeral=True)
         return
     key = key_for_interaction(interaction)
     if not model or model.strip() == "__clear__":
@@ -2343,9 +2423,9 @@ class SessionPicker(discord.ui.View):
 @tree.command(name="sessions",
                      description="Browse and switch opencode sessions")
 async def sessions_cmd(interaction: discord.Interaction):
-    if ALLOWED and str(interaction.user.id) not in ALLOWED:
+    if interaction_tier(interaction) < TIER_DJ:
         await interaction.response.send_message(
-            "not allowed.", ephemeral=True)
+            "not permitted (`/sessions` needs DJ+).", ephemeral=True)
         return
     key = key_for_interaction(interaction)
     await interaction.response.defer(ephemeral=True)
@@ -2471,16 +2551,23 @@ async def on_message(message):
             "`send me <path>` sends a file back directly.\n"
             "Rapid messages merge into one follow-up - wait for the check.\n"
             "`/sessions` - browse and switch opencode sessions (servers).\n"
-            "`/model` - switch the model for this chat."
+            "`/model` - switch the model for this chat.\n"
+            "DJ+ only: `!say` `!model` `!join` `!leave` `!skip` `!cancel`\n"
+            "`!voice` `!voiceprofile` `!voiceready` `!new`, file drop/send.\n"
+            "Plain chat, `!status`, `!help`: everyone allowed."
             + extra)
         return
 
     key = session_key_for(message)
     if content.lower() == "!cancel":
+        if not await require_tier(message, TIER_DJ, "!cancel"):
+            return
         await cancel_turn(key, message.channel)
         return
 
     if content.lower() == "!new":
+        if not await require_tier(message, TIER_DJ, "!new"):
+            return
         SESSIONS.pop(key, None)
         USAGE.pop(key, None)
         save_state()
@@ -2557,6 +2644,8 @@ async def on_message(message):
         return
 
     if content.lower() == "!voice" or content.lower().startswith("!voice "):
+        if not await require_tier(message, TIER_DJ, "!voice"):
+            return
         arg = content[6:].strip().lower()
         if arg in ("on", "off"):
             VOICE_OVERRIDES[key] = (arg == "on")
@@ -2574,6 +2663,8 @@ async def on_message(message):
 
     if content.lower() == "!voiceprofile" or content.lower().startswith(
             "!voiceprofile "):
+        if not await require_tier(message, TIER_DJ, "!voiceprofile"):
+            return
         arg = content[len("!voiceprofile"):].strip()
         if not arg:
             cur = VOICE_PROFILE_OVERRIDES.get(key)
@@ -2607,6 +2698,8 @@ async def on_message(message):
         return
 
     if content.lower() == "!join":
+        if not await require_tier(message, TIER_DJ, "!join"):
+            return
         guild = getattr(message, "guild", None)
         if guild is None:
             await message.channel.send(
@@ -2648,6 +2741,8 @@ async def on_message(message):
         return
 
     if content.lower() in ("!leave", "!disconnect", "!stop"):
+        if not await require_tier(message, TIER_DJ, "!leave"):
+            return
         guild = getattr(message, "guild", None)
         vc = guild.voice_client if guild is not None else None
         if vc is None or not vc.is_connected():
@@ -2671,6 +2766,8 @@ async def on_message(message):
         return
 
     if content.lower() == "!skip":
+        if not await require_tier(message, TIER_DJ, "!skip"):
+            return
         guild = getattr(message, "guild", None)
         vc = guild.voice_client if guild is not None else None
         if vc is None or not vc.is_connected():
@@ -2700,6 +2797,8 @@ async def on_message(message):
         return
 
     if content.lower() == "!say" or content.lower().startswith("!say "):
+        if not await require_tier(message, TIER_DJ, "!say"):
+            return
         line = content[4:].strip()
         if not line:
             await message.channel.send(
@@ -2727,6 +2826,8 @@ async def on_message(message):
         return
 
     if content.lower() == "!voiceready":
+        if not await require_tier(message, TIER_DJ, "!voiceready"):
+            return
         results = await voice_ready()
         lines = []
         for label, ok, detail in results:
@@ -2740,6 +2841,8 @@ async def on_message(message):
         return
 
     if content.lower() == "!model" or content.lower().startswith("!model "):
+        if not await require_tier(message, TIER_DJ, "!model"):
+            return
         arg = content[6:].strip()
         items = await asyncio.to_thread(get_models)
         action, value = resolve_model_arg(arg, items)
@@ -2772,6 +2875,8 @@ async def on_message(message):
     # --- direct send: "send me <path>" uploads without opencode ---
     send = SEND_RE.match(content) if not message.attachments else None
     if send:
+        if not await require_tier(message, TIER_DJ, "send me"):
+            return
         try:
             p = resolve_outbound(send.group(1))
         except JailViolation as e:
@@ -2878,6 +2983,8 @@ async def on_message(message):
         # --- direct drop: "place this in <dir>" moves files, no opencode ---
         drop = DROP_RE.match(content) if saved_files else None
         if drop:
+            if not await require_tier(message, TIER_DJ, "place this in"):
+                return
             try:
                 target = resolve_target_dir(drop.group(1))
             except JailViolation as e:

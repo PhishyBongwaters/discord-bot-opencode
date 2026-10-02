@@ -101,6 +101,7 @@ Two-way chat between Discord and opencode. DM the bot, it forwards to `opencode 
 - **Concurrency cap:** at most `MAX_CONCURRENT_TURNS` opencode runs at once (default 2, `0` = unlimited); extra turns wait FIFO and show in `!status` (`queue: ... | global: N running, M waiting`). `!cancel` while waiting drops the turn without running it.
 - **Usage:** per-turn tokens/cost logged; `!status` shows session totals (in-memory, resets on restart).
 - **Guild sessions are shared:** everyone talking to the bot in one channel shares that channel's opencode session. Replies thread under your message.
+- **Permissions (tiers):** `ALLOWED_USER_IDS` stays the outer allow-list. Inside it there are three tiers — **admin** > **DJ** > **everyone**. DJ+ commands: `!say` `!model` `!join` `!leave` `!skip` `!cancel` `!voice` `!voiceprofile` `!voiceready` `!new`, direct file drop/send, `/model`, `/sessions`. Plain chat, `!status`, and `!help` are everyone. Configure with `DJ_USER_IDS` / `DJ_ROLE_IDS` / `ADMIN_USER_IDS` / `ADMIN_ROLE_IDS` (comma-separated ids; role checks use the author's guild roles, DMs fall back to the user-id lists). Defaults preserve single-operator behavior: `ADMIN_USER_IDS` defaults to `ALLOWED_USER_IDS`, so with no role config nothing changes. (With `ALLOWED_USER_IDS` empty and `ADMIN_USER_IDS` unset, tiers are disabled — open mode, as before.) Denied commands get `not permitted (...)` — plain for `!`, ephemeral for `/`.
 
 ## Attachments
 
