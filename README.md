@@ -149,6 +149,8 @@ Prerequisites: Voicebox running with a `Computer` (or your) profile and a Whispe
 
 ## Slash commands
 
+Every `!` command has a slash equivalent with the same behavior — replies are ephemeral (only you see them) instead of public: `/new` `/status` `/voice` (on/off picker) `/voiceprofile` `/join` `/leave` `/say` `/voiceready` `/cancel` `/skip` `/help`, plus the pre-existing `/sessions` and `/model` below. They run through the same code path as the `!` forms (same tier gates from Permissions), just routed ephemeral.
+
 `/sessions` shows a dropdown of the bot project's opencode sessions (newest first, via `opencode session list`). Each entry is tagged `[bot]` (the bot has used it in this chat) or `[cli]` (terminal/other), with the active session starred. Pick one to switch this chat to it, or `+ New session` for a fresh start. Everything is ephemeral (only you see it).
 
 `/model` switches the model for this chat with autocomplete over `opencode models` (`provider/model`, 50+ entries — hence search, not a dropdown). Pick `Default` to clear back to `OPENCODE_MODEL`/opencode default. Overrides persist per chat and show in `!status`.

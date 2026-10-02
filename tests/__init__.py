@@ -153,6 +153,11 @@ def _build_discord_stub():
             return fn
         return deco
 
+    def choices(**kwargs):
+        def deco(fn):
+            return fn
+        return deco
+
     class Choice:
         def __init__(self, name=None, value=None):
             self.name = name
@@ -162,6 +167,7 @@ def _build_discord_stub():
     app_commands.CommandTree = CommandTree
     app_commands.describe = describe
     app_commands.autocomplete = autocomplete
+    app_commands.choices = choices
     app_commands.Choice = Choice
 
     discord.Activity = Activity
