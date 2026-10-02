@@ -307,6 +307,11 @@ SAY_DIR = Path(os.environ.get("SAY_DIR", "say_queue").strip() or ".bot-voice-dis
 SAY_DIR_ENABLED = os.environ.get("SAY_DIR", "say_queue").strip() != ""
 SAY_POLL = _env_float("SAY_POLL", 2.0) or 2.0
 SAY_MAX_BYTES = _env_int("SAY_MAX_BYTES", 8192)
+TEXT_DIR = Path(os.environ.get("TEXT_DIR", "text_queue").strip() or ".bot-text-disabled")
+TEXT_DIR_ENABLED = os.environ.get("TEXT_DIR", "text_queue").strip() != ""
+TEXT_POLL = _env_float("TEXT_POLL", 2.0) or 2.0
+TEXT_MAX_BYTES = _env_int("TEXT_MAX_BYTES", 4000)
+TEXT_MAX_PER_MINUTE = _env_int("TEXT_MAX_PER_MINUTE", 10)
 VC_AUTOJOIN = os.environ.get("VC_AUTOJOIN", "").strip()
 VC_AUTOREJOIN = os.environ.get("VC_AUTOREJOIN", "1") == "1"
 VC_AUTOLEAVE_MINUTES = _env_float("VC_AUTOLEAVE_MINUTES", 5.0)
@@ -1750,6 +1755,9 @@ async def _autoleave_countdown(guild_id, channel_id, delay):
 
 SAY_STARTED = False
 SAY_FAIL_AT = {}  # path -> last failed attempt (monotonic)
+TEXT_STARTED = False
+TEXT_FAIL_AT = {}  # path -> last failed attempt (monotonic)
+TEXT_RATE = {}  # channel_id -> deque of send times (monotonic, 60s window)
 
 
 def say_targets(path):
@@ -1827,6 +1835,91 @@ async def say_watcher():
             return
         except Exception:
             log.exception("say-watcher loop failed")
+
+
+def text_target(path):
+    """Parse `<channel_id>_<label>.txt` -> channel id, or None when invalid."""
+    chan, sep, _label = path.stem.partition("_")
+    if not sep:
+        return None
+    try:
+        return int(chan)
+    except ValueError:
+        return None
+
+
+async def process_text_file(path):
+    """Deliver one text drop-in to its Discord channel. Returns True when consumed."""
+    target = text_target(path)
+    if target is None:
+        log.warning("text-queue skipping %s: name must be <channel_id>_<label>.txt",
+                    path.name)
+        return True  # consume: never deliverable
+    try:
+        raw = path.read_bytes()
+    except OSError as e:
+        log.warning("text-queue read failed (%s): %s", path.name, e)
+        return True  # consume: unreadable
+    text = raw.decode("utf-8", errors="replace").strip()
+    if not text:
+        return True  # consume empty files silently
+    if len(raw) > TEXT_MAX_BYTES:
+        text = (raw[:TEXT_MAX_BYTES].decode("utf-8", errors="ignore").strip()
+                + "\n…(truncated, file exceeded TEXT_MAX_BYTES)")
+    now = time.monotonic()
+    last = TEXT_FAIL_AT.get(str(path), 0.0)
+    if now - last < 60:
+        return False  # backing off, keep file
+    stamps = TEXT_RATE.setdefault(target, collections.deque())
+    while stamps and now - stamps[0] > 60:
+        stamps.popleft()
+    if len(stamps) >= max(TEXT_MAX_PER_MINUTE, 1):
+        return False  # over per-channel rate, hold for later
+    try:
+        ch = client.get_channel(target)
+        if ch is None:
+            ch = await client.fetch_channel(target)
+    except Exception as e:
+        TEXT_FAIL_AT[str(path)] = now
+        log.warning("text-queue channel %s unreachable: %s", target, e)
+        return False
+    try:
+        await ch.send(text)
+    except Exception as e:
+        TEXT_FAIL_AT[str(path)] = now
+        log.warning("text-queue send to %s failed: %s", target, e)
+        return False
+    stamps.append(now)
+    TEXT_FAIL_AT.pop(str(path), None)
+    return True
+
+
+async def text_watcher():
+    """Background loop: deliver *.txt drop-ins from TEXT_DIR, then delete."""
+    while True:
+        try:
+            await asyncio.sleep(TEXT_POLL)
+            if not TEXT_DIR.is_dir():
+                continue
+            files = sorted(
+                (p for p in TEXT_DIR.iterdir()
+                 if p.is_file() and p.suffix.lower() == ".txt"
+                 and not p.name.startswith(".")),
+                key=lambda p: p.stat().st_mtime)
+            for p in files[:20]:
+                try:
+                    if await process_text_file(p):
+                        try:
+                            p.unlink()
+                        except OSError:
+                            pass
+                        TEXT_FAIL_AT.pop(str(p), None)
+                except Exception:
+                    log.exception("text-queue failed on %s", p.name)
+        except asyncio.CancelledError:
+            return
+        except Exception:
+            log.exception("text-watcher loop failed")
 
 
 async def autojoin_vc():
@@ -3016,12 +3109,17 @@ async def handle_text_command(message, content, key):
 async def on_ready():
     log.info("logged in as %s (id %s)", client.user, client.user.id)
     await update_presence()
-    global TREE_SYNCED, SAY_STARTED
+    global TREE_SYNCED, SAY_STARTED, TEXT_STARTED
     if not SAY_STARTED and SAY_DIR_ENABLED:
         SAY_STARTED = True
         SAY_DIR.mkdir(parents=True, exist_ok=True)
         asyncio.ensure_future(say_watcher())
         log.info("say-queue watching %s", SAY_DIR)
+    if not TEXT_STARTED and TEXT_DIR_ENABLED:
+        TEXT_STARTED = True
+        TEXT_DIR.mkdir(parents=True, exist_ok=True)
+        asyncio.ensure_future(text_watcher())
+        log.info("text-queue watching %s", TEXT_DIR)
     await autojoin_vc()
     if VOICEBOX_WARMUP:
         asyncio.ensure_future(warmup_voice())

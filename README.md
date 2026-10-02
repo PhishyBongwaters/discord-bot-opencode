@@ -84,6 +84,10 @@ Two-way chat between Discord and opencode. DM the bot, it forwards to `opencode 
 | `SAY_DIR` | `say_queue` | Dir watched for `*.txt` drop-ins the bot speaks in VC (empty disables); see Voice |
 | `SAY_POLL` | `2.0` | Seconds between say-queue scans |
 | `SAY_MAX_BYTES` | `8192` | Largest say file accepted (bigger is skipped) |
+| `TEXT_DIR` | `text_queue` | Dir watched for `<channel_id>_<label>.txt` drop-ins the bot sends as Discord messages (empty disables); see Text-queue |
+| `TEXT_POLL` | `2.0` | Seconds between text-queue scans |
+| `TEXT_MAX_BYTES` | `4000` | Largest text file delivered whole (bigger is truncated with a note) |
+| `TEXT_MAX_PER_MINUTE` | `10` | Max delivered messages per channel per minute (excess held) |
 | `VC_AUTOJOIN` | empty (= disabled) | Voice channel id to join on startup and sit in until restart |
 | `VC_AUTOREJOIN` | `1` | `1` = rejoin the autojoin channel if disconnected unexpectedly (`!leave` still sticks) |
 | `VOICEBOX_WARMUP` | `1` | `1` = one silent TTS at startup so the first real reply skips model-load cost |
@@ -144,6 +148,8 @@ Per-chat control: `!voice off` mutes spoken replies entirely (VC or file), `!voi
 
 **Say-queue (agent-initiated speech):** the bot watches `SAY_DIR` (default `say_queue/`) every `SAY_POLL` seconds. Drop in a `.txt` file and it speaks it in VC via the same Computer voice — no Discord message needed, no opencode call. Plain `*.txt` plays in every connected VC; `<guildid>_*.txt` targets one server. Files are deleted after speaking; if no VC is connected they're held until one is (TTS failures retry with backoff). This is the path for speaking *from* a shell/agent session: anything that can write a file (including opencode itself mid-turn, or another harness) can make the bot talk. `!say <text>` is the same thing from Discord chat. `!status` shows pending say files.
 
+**Text-queue (agent-initiated messages):** the bot watches `TEXT_DIR` (default `text_queue/`) every `TEXT_POLL` seconds for proactive outbound text — the fire-and-forget path for local tasks and background jobs that need to post to Discord *through* the already-running bot, no inbound message required. Drop in `<channel_id>_<label>.txt` (e.g. `123456789012345678_nightly.txt`) and the bot sends its contents as a message to that channel (works for DMs too — use the DM channel id). Files larger than `TEXT_MAX_BYTES` (default 4000) are truncated with a note rather than skipped; at most `TEXT_MAX_PER_MINUTE` (default 10) messages per channel per minute go out, excess files are held; failed sends back off ~60s and retry; the file is deleted after successful delivery. Empty `TEXT_DIR` disables it. Contrast with `discord-send.py`, which is a standalone one-shot REST sender that talks to Discord directly with the bot token — no gateway, no bot process needed — for shell scripts and CI jobs that just need to send a message themselves.
+
 **Voice mode (agent behavior):** when enabled, the agent splits turns like a call with screen-share — human summaries, status, questions, and completion notices go to voice (one short say-queue drop per turn, plain conversational language, no code/paths/URLs); all technical content (code, diffs, logs, exact commands, paths) stays in text chat. Before any action likely to raise a permission/approval gate, it speaks a one-line heads-up first (the gate itself still appears in text as normal). Toggle: say `voice mode on/off`, backed by the flag file `.opencode/voice-mode.on` (presence = on). The flag is local-only and gitignored, so it never leaks into clones — but any agent session in this repo (including the bot's own opencode backend, which discovers the `discord-voice` skill) honors it. Defined in full in `.opencode/skills/discord-voice/SKILL.md`.
 
 Prerequisites: Voicebox running with a `Computer` (or your) profile and a Whisper model downloaded (first `/transcribe` may return 202 while it downloads — the bot treats that as "transcription unavailable" and falls back to `--file`). VC playback additionally needs `ffmpeg` on PATH and Opus (`pip install -r requirements.txt` covers `PyNaCl`/`davey`; the Windows Opus DLL is auto-loaded from next to `bot.py`, override with `OPUS_LIB`). There is no live VC *listening* — `discord.py` can't receive audio; voice notes are the input path.
@@ -160,7 +166,7 @@ Notes: per-guild sync is instant on startup; global sync (which covers DMs) can 
 
 ## discord-send.py
 
-One-shot REST sender, stdlib-only (tested: channel + DM delivery work):
+One-shot REST sender, stdlib-only (tested: channel + DM delivery work). Use this when the bot process isn't running or you want to send a message directly with the token — no gateway connection, no opencode call, one command and done. For posting *through* the already-running bot (rate-capped, backoff, fire-and-forget from local tasks), drop a file in the text-queue instead (see Text-queue above).
 
 ```
 python discord-send.py --to '#ops' "deploy finished"
