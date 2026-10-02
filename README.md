@@ -128,7 +128,7 @@ Spoken delivery, in order of preference:
 1. **Voice channel (servers):** sit in a VC and send `!join` (`!oc !join` / `@bot !join`). Replies stream sentence-by-sentence (first audio starts while later sentences still generate) and queue serially — no file to click. `!leave` disconnects. DMs have no VC, so they always use files.
 2. **`reply.wav` file:** when not joined (or in DMs), the spoken reply attaches to the channel.
 
-Per-chat control: `!voice off` mutes spoken replies entirely (VC or file), `!voice on` re-enables; `!voice` shows state. TTS failure never blocks the text reply.
+Per-chat control: `!voice off` mutes spoken replies entirely (VC or file), `!voice on` re-enables; `!voice` shows state. `!voiceprofile <name-or-id>` gives this chat its own Voicebox voice (mirrors the `!voice` on/off storage, persists in the state file); `!voiceprofile clear` resets to the global `VOICEBOX_PROFILE`, and `!voice`/`!status` show the effective profile. Unknown names are rejected with the available profile list. TTS failure never blocks the text reply.
 
 **TTS cache:** every spoken line is cached under `VOICEBOX_CACHE_DIR` (default `tts_cache/`) by content hash of (voice profile + text) — repeats (greetings, `!say` reruns, status phrases) skip Voicebox entirely, which also saves local GPU time. Hits/misses are logged. The cache prunes itself to `VOICEBOX_CACHE_FILES` (default 500) / `VOICEBOX_CACHE_MB` (default 200), newest kept; corrupt entries are deleted and regenerated, never served. Set `VOICEBOX_CACHE_DIR` empty to disable. Shared by turn replies, `!say`, the say-queue, and `[[say:]]` markers — they all funnel through one TTS call.
 
