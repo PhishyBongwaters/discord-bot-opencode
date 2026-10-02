@@ -59,6 +59,7 @@ Two-way chat between Discord and opencode. DM the bot, it forwards to `opencode 
 | `OPENCODE_AGENT` | empty | Passed as `--agent` |
 | `OPENCODE_AUTO` | `0` | Set `1` to pass `--auto` (auto-approve tools). Required for unattended file moves/writes. Only for users you trust |
 | `OPENCODE_TIMEOUT` | `600` | Seconds per run |
+| `MAX_CONCURRENT_TURNS` | `2` | Max simultaneous opencode runs across all chats; extra turns wait FIFO (see `!status`); `0` = unlimited |
 | `STATE_FILE` | `state/sessions.json` | Maps Discord session key -> opencode session id |
 | `GUILD_PREFIX` | `!oc` | Server-channel prefix |
 | `ATTACH_DIR` | `attachments` | Inbound inbox root (`<dir>/<session_key>/`) |
@@ -95,7 +96,8 @@ Two-way chat between Discord and opencode. DM the bot, it forwards to `opencode 
 - **Coalescing:** if you send more messages while a turn is running, they merge into a single follow-up turn (separated by `---`) instead of one run each. The follow-up reply covers everything merged. To force separate turns, wait for the check react first.
 - **Cancel:** `!cancel` kills the in-flight opencode run for that chat, drops queued follow-ups, posts `cancelled ...`, and flips reacts to cross. One `!cancel` kills the current run — if a follow-up already started, send it again. If the turn already reached the reply/voice stage there's no subprocess left, so `!cancel` only drops queued messages and says so. Other chats are unaffected, and voice-channel playback is never stopped (use `!skip` for that).
 - **Skip:** `!skip` stops the current voice-channel clip, drops the queued clips, and abandons in-flight TTS for that server, then posts `skipped ...`. The bot stays connected (this is not `!leave`). Idle with nothing queued posts `nothing playing.`; in DMs or when not in a voice channel it posts `not in a voice channel.` Other servers are unaffected.
-- **Presence:** Listening while idle, DND "working..." while any turn runs.
+- **Presence:** Listening while idle, DND "working..." while any turn runs (waiting turns count as working).
+- **Concurrency cap:** at most `MAX_CONCURRENT_TURNS` opencode runs at once (default 2, `0` = unlimited); extra turns wait FIFO and show in `!status` (`queue: ... | global: N running, M waiting`). `!cancel` while waiting drops the turn without running it.
 - **Usage:** per-turn tokens/cost logged; `!status` shows session totals (in-memory, resets on restart).
 - **Guild sessions are shared:** everyone talking to the bot in one channel shares that channel's opencode session. Replies thread under your message.
 

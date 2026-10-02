@@ -9,6 +9,9 @@
 - Direct sends ("send me <path>") upload without involving opencode.
 - Rapid messages coalesce: arrivals during a running turn merge into a
   single follow-up turn per session instead of queueing N runs.
+- Global cap: at most MAX_CONCURRENT_TURNS opencode runs at once
+  (default 2, 0 = unlimited); extra turns wait FIFO, still show DND,
+  and appear in `!status`.
 - Presence: Listening when idle, DND "working..." while any turn runs.
 - Other attachments go to opencode via --file (text/code/images incl.
   gif) or path-only (video); `[[attach:path]]` markers come back as files.
@@ -26,6 +29,9 @@ Config via env (or .env in cwd / ~/.config/opencode-discord/):
                         Only enable for users you trust; it lets the agent
                         run shell commands and edit files unattended.
     OPENCODE_TIMEOUT    seconds per run (default 600)
+    MAX_CONCURRENT_TURNS  max simultaneous opencode runs across all chats
+                        (default 2; extra turns wait FIFO, see `!status`;
+                        0 = unlimited)
     STATE_FILE          default ./state/sessions.json
     GUILD_PREFIX        default "!oc"
     ATTACH_DIR          default ./attachments (inbound inbox)
@@ -75,6 +81,7 @@ Developer Portal -> Bot -> Privileged Gateway Intents).
 """
 
 import asyncio
+import collections
 import io
 import json
 import logging
@@ -152,6 +159,11 @@ OPENCODE_MODEL = os.environ.get("OPENCODE_MODEL", "").strip()
 OPENCODE_AGENT = os.environ.get("OPENCODE_AGENT", "").strip()
 OPENCODE_AUTO = os.environ.get("OPENCODE_AUTO", "0") == "1"
 OPENCODE_TIMEOUT = _env_int("OPENCODE_TIMEOUT", 600)
+MAX_CONCURRENT_TURNS = _env_int("MAX_CONCURRENT_TURNS", 2)
+if MAX_CONCURRENT_TURNS < 0:
+    print(f"WARNING: MAX_CONCURRENT_TURNS invalid ({MAX_CONCURRENT_TURNS}) - "
+          "using 2", file=sys.stderr)
+    MAX_CONCURRENT_TURNS = 2
 STATE_FILE = Path(os.environ.get("STATE_FILE", "state/sessions.json"))
 GUILD_PREFIX = os.environ.get("GUILD_PREFIX", "!oc")
 ATTACH_DIR = Path(os.environ.get("ATTACH_DIR", "attachments"))
@@ -398,6 +410,21 @@ TURN_STATE = {}  # key -> {"proc": Popen|None, "cancelled": bool}
 
 ACTIVE_TURNS = 0
 ACTIVE_GUARD = asyncio.Lock()
+
+# Global turn gate: at most MAX_CONCURRENT_TURNS opencode runs at once.
+# Explicit FIFO waiter queue (not a bare Semaphore) so wake order is
+# structural, not an implementation detail of Semaphore wake-ups. Message
+# intake is NOT gated: sessions keep accepting/coalescing while their turn
+# waits. The slot covers the whole run_batches call (run + deliver_reply,
+# voice TTS included) — one acquire/release pair, so a session's text+voice
+# delivery stays atomic; slow TTS can briefly hold a slot, accepted
+# deliberately for auditability. Waiting turns count in ACTIVE_TURNS, so
+# presence stays DND while turns are queued. 0 = unlimited: the gate is
+# bypassed entirely (no acquire/release, zero behavior change).
+TURN_GATE_GUARD = asyncio.Lock()
+TURN_SLOTS_HELD = 0
+TURN_WAITERS = collections.deque()  # FIFO of {"key","event","cancelled","granted"}
+TURN_WAITER_BY_KEY = {}  # key -> waiter entry while queued (for !cancel)
 TREE_SYNCED = False
 
 IDLE_ACTIVITY = discord.Activity(
@@ -415,6 +442,87 @@ async def update_presence():
                 status=discord.Status.online, activity=IDLE_ACTIVITY)
     except Exception as e:
         log.warning("presence update failed: %s", e)
+
+
+async def acquire_turn_slot(key):
+    """Take a global run slot in FIFO order.
+
+    Raises TurnCancelled when !cancel fires while queued — the waiter then
+    consumes no slot and posts nothing. Bypassed when unlimited.
+    """
+    global TURN_SLOTS_HELD
+    if MAX_CONCURRENT_TURNS <= 0:
+        return
+    async with TURN_GATE_GUARD:
+        if TURN_SLOTS_HELD < MAX_CONCURRENT_TURNS and not TURN_WAITERS:
+            TURN_SLOTS_HELD += 1
+            log.debug("[%s] turn slot granted at once (%d/%d)",
+                      key, TURN_SLOTS_HELD, MAX_CONCURRENT_TURNS)
+            return
+        entry = {"key": key, "event": asyncio.Event(),
+                 "cancelled": False, "granted": False}
+        TURN_WAITERS.append(entry)
+        TURN_WAITER_BY_KEY[key] = entry
+        log.info("[%s] waiting for a turn slot (%d waiting)",
+                 key, len(TURN_WAITERS))
+    await entry["event"].wait()
+    # Woken by release_turn_slot (granted) or cancel_waiting_turn. The map
+    # pop is guard-free: dict ops between awaits can't interleave, and the
+    # entry is ours alone from here on (one waiter per session, and a later
+    # cancel finds nothing once popped).
+    TURN_WAITER_BY_KEY.pop(key, None)
+    if entry["cancelled"]:
+        if entry["granted"]:
+            # Slot was handed over just as !cancel fired: pass it on at
+            # once so capacity is never leaked.
+            await release_turn_slot()
+        raise TurnCancelled()
+    # Granted and wanted: release_turn_slot already counted the slot.
+
+
+async def release_turn_slot():
+    """Free one slot, handing it to the oldest non-cancelled waiter (FIFO).
+
+    Cancelled entries still queued are skipped without taking a slot.
+    No-op when unlimited.
+    """
+    global TURN_SLOTS_HELD
+    if MAX_CONCURRENT_TURNS <= 0:
+        return
+    async with TURN_GATE_GUARD:
+        TURN_SLOTS_HELD -= 1
+        while TURN_WAITERS:
+            nxt = TURN_WAITERS.popleft()
+            if nxt.get("cancelled"):
+                continue  # !cancel already woke it; it takes no slot.
+            nxt["granted"] = True
+            TURN_SLOTS_HELD += 1
+            log.debug("[%s] turn slot granted from queue (%d/%d)",
+                      nxt["key"], TURN_SLOTS_HELD, MAX_CONCURRENT_TURNS)
+            nxt["event"].set()
+            break
+
+
+async def cancel_waiting_turn(key):
+    """Abort a turn queued for a global slot. Returns True when one was.
+
+    Never consumes a slot: still-queued entries are dequeued, and an entry
+    granted-but-not-yet-woken is flagged so its waker hands the slot on.
+    """
+    if MAX_CONCURRENT_TURNS <= 0:
+        return False
+    async with TURN_GATE_GUARD:
+        entry = TURN_WAITER_BY_KEY.get(key)
+        if entry is None:
+            return False
+        entry["cancelled"] = True
+        try:
+            TURN_WAITERS.remove(entry)
+        except ValueError:
+            pass  # already popped by release; the waker releases the slot.
+        entry["event"].set()
+        log.info("[%s] turn cancelled while waiting for a slot", key)
+        return True
 
 
 def extract_session_id(ndjson_text):
@@ -1594,6 +1702,11 @@ async def cancel_turn(key, channel):
         alive = proc is not None and proc.poll() is None
         if alive:
             st["cancelled"] = True
+    # Global gate: a turn still waiting for a slot has no proc yet — wake
+    # its waiter so it exits without consuming a slot or posting. (Its own
+    # cleanup flips its messages' reacts; the confirmation post below is
+    # the only message sent.)
+    await cancel_waiting_turn(key)
     async with q.guard:
         pending = q.buffer
         q.buffer = []
@@ -1640,7 +1753,38 @@ async def run_batches(key, channel, q, batch, inbox, status):
         first = ACTIVE_TURNS == 1
     if first:
         await update_presence()
+    # Global gate: one slot for the whole call (every follow-up batch plus
+    # its reply, voice TTS included). One acquire/release pair keeps the
+    # audit to a single flag: the outer finally releases exactly once on
+    # every post-acquire exit (normal return, TurnCancelled mid-run, or an
+    # unexpected exception). A wait-cancel raises before slot_held flips —
+    # or hands the slot straight on inside acquire — so it never leaks.
+    # Holding through TTS can briefly idle a slot, accepted deliberately to
+    # keep each session's text+voice delivery atomic and the code obvious.
+    slot_held = False
     try:
+        if MAX_CONCURRENT_TURNS > 0:
+            try:
+                await acquire_turn_slot(key)
+            except TurnCancelled:
+                log.info("[%s] turn cancelled while waiting for slot", key)
+                with TURN_LOCK:
+                    TURN_STATE.pop(key, None)
+                async with q.guard:
+                    rest = q.buffer
+                    q.buffer = []
+                own = [m for m, _, _ in batch]
+                for m in own:
+                    await swap_react(m, REACT_START, REACT_ERROR)
+                for m, _, _ in rest:
+                    await swap_react(m, REACT_START, REACT_ERROR)
+                if status is not None:
+                    try:
+                        await status.delete()
+                    except Exception:
+                        pass
+                return
+            slot_held = True
         while True:
             msgs = [m for m, _, _ in batch]
             combined = "\n\n---\n\n".join(p for _, p, _ in batch)
@@ -1693,6 +1837,8 @@ async def run_batches(key, channel, q, batch, inbox, status):
                 log.info("[%s] coalesced follow-up: %d msg(s)",
                          key, len(batch))
     finally:
+        if slot_held:
+            await release_turn_slot()
         async with q.guard:
             stuck = [m for m, _, _ in q.buffer]
             q.buffer = []
@@ -2062,6 +2208,15 @@ async def on_message(message):
         q = get_queue(key)
         queue_s = (f"running + {len(q.buffer)} pending" if q.running
                    else "idle")
+        if MAX_CONCURRENT_TURNS > 0:
+            async with TURN_GATE_GUARD:
+                _run_n = TURN_SLOTS_HELD
+                _wait_n = len(TURN_WAITERS)
+            gate_s = f" | global: {_run_n} running, {_wait_n} waiting"
+        else:
+            async with ACTIVE_GUARD:
+                _active_n = ACTIVE_TURNS
+            gate_s = f" | global: {_active_n} running (unlimited)"
         model = MODEL_OVERRIDES.get(key)
         model_s = model if model else (
             f"{OPENCODE_MODEL} (env)" if OPENCODE_MODEL else "opencode default")
@@ -2094,7 +2249,7 @@ async def on_message(message):
             f"turns: {u['turns']} | tokens: {u['in']} in / {u['out']} out | "
             f"cost: ${u['cost']:.4f}\n"
             f"inbox: {inbox_s}\n"
-            f"queue: {queue_s}")
+            f"queue: {queue_s}{gate_s}")
         return
 
     if content.lower() == "!voice" or content.lower().startswith("!voice "):
