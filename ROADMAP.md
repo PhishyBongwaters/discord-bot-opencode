@@ -9,31 +9,31 @@ STT voice notes, say-queue, `!say`, `!voiceready`, autojoin, warmup,
 
 ## Control (brakes first — nothing here can currently be stopped)
 
-- [ ] #1 `!cancel` in-flight opencode turn
-- [ ] #2 `!skip` VC playback
-- [ ] #3 Global `MAX_CONCURRENT_TURNS`
+- [x] #1 `!cancel` in-flight opencode turn
+- [x] #2 `!skip` VC playback
+- [x] #3 Global `MAX_CONCURRENT_TURNS`
 
 ## Safety
 
-- [ ] #4 Jail drop/send filesystem paths
-- [ ] #5 Role-based permissions (DJ/admin split)
+- [x] #4 Jail drop/send filesystem paths
+- [x] #5 Role-based permissions (DJ/admin split)
 
 ## Media
 
-- [ ] #6 Video thumbnails via ffmpeg
+- [x] #6 Video thumbnails via ffmpeg
 
 ## UX polish
 
-- [ ] #7 Reaction controls (cancel / replay / regenerate)
-- [ ] #8 Auto-leave VC when alone
-- [ ] #9 TTS hash cache
-- [ ] #10 Per-chat voice profile (`!voiceprofile`)
-- [ ] #12 Slash parity for `!` commands
-- [ ] #13 Scheduled/proactive text
+- [x] #7 Reaction controls (cancel / replay / regenerate)
+- [x] #8 Auto-leave VC when alone
+- [x] #9 TTS hash cache
+- [x] #10 Per-chat voice profile (`!voiceprofile`)
+- [x] #12 Slash parity for `!` commands
+- [x] #13 Scheduled/proactive text
 
 ## Process
 
-- [ ] #11 Committed `tests/` suite
+- [x] #11 Committed `tests/` suite
 
 ---
 
