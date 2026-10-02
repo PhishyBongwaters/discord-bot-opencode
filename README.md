@@ -164,6 +164,26 @@ python discord-send.py --list
 
 With `DEFAULT_DISCORD_CHANNEL` set in `.env`, omit `--to`. Targets: `#name`, `<channel_id>`, `channel:<id>`, `dm:<user_id>`, `user:<id>`, `@<id>`. Exit codes: 0 ok, 1 delivery failure, 2 usage error. Requires `chunking.py` alongside for fence-aware splitting. Retries Discord 429s (up to 3, honors `retry_after`).
 
+## Tests
+
+Stdlib-only suite (`tests/`, `unittest`) — no Discord token, voice, or
+network needed. `tests/__init__.py` stubs the `discord` module and pins
+config to temp dirs before importing `bot.py`, so it runs on any machine
+with Python 3.9+:
+
+```
+python -m unittest discover -s tests -t .
+```
+
+Covers: marker parsing (`[[attach:]]`/`[[react:]]`/`[[say:]]` incl. caps),
+sentence chunking, `clean_for_tts`, turn-queue coalescing (buffered
+arrivals drain as one follow-up batch), the voicebox readiness
+counter/auto-off, say-queue consume/hold/speak/backoff, prompt assembly
+(bridge note, model-arg resolution, usage extraction), file-jail
+confinement, inbox pruning, and session-state persistence. The tests
+encode current behavior — if one fails after a change, the change
+altered behavior; fix the code or file a new issue, not the test.
+
 ## Troubleshooting
 
 - **"application did not respond"**: you used `/new`. Send `!new` as a plain message instead.
