@@ -58,6 +58,23 @@ and opencode sees `[Voice message NAME (Ns): transcript]`. There is NO live
 VC listening (discord.py cannot receive audio) — voice notes are the input
 path. STT failure falls back to `--file`, never silence.
 
+## Voice mode (agent behavior toggle)
+
+When the user enables voice mode ("voice mode on", or the flag file
+`.opencode/voice-mode.on` exists), split every turn like a call with
+screen-share: human replies go to voice, technical work stays in text.
+
+- **Voice (say-queue):** 1–3 sentences, conversational, plain words. Status,
+  summaries, questions, completion notices. No code, no paths, no URLs, no
+  numbers-as-data, no markdown, no emoji — say "the bot file", not
+  `D:\Projects\discord-bot\bot.py`. One drop per turn max unless something
+  genuinely needs interrupting; milestones over micro-steps.
+- **Text (chat reply):** everything technical — code blocks, diffs, logs,
+  exact commands, config values, file paths.
+- Never read text content aloud verbatim; paraphrase the human meaning.
+- "Voice mode off" or deleting the flag file returns to text-only replies
+  (turn replies still follow the bot's own `!voice` setting).
+
 ## Pitfalls
 
 1. Say-queue files are fire-and-forget: no confirmation except deletion.
