@@ -70,6 +70,7 @@ Two-way chat between Discord and opencode. DM the bot, it forwards to `opencode 
 | `VOICEBOX_VOICE` | `1` | `1` = attach a spoken reply to every turn; `0` = text-only unless a chat opts in with `!voice on` |
 | `VOICEBOX_TIMEOUT` | `120` | Seconds per TTS/STT request |
 | `VOICEBOX_MAX_CHARS` | `1200` | Max chars sent to TTS per turn (full text still posts) |
+| `VC_CHUNK_CHARS` | `400` | Max chars per spoken chunk when streaming to VC (smaller = first audio sooner) |
 | `VOICEBOX_TRANSCRIBE` | `1` | `1` = transcribe inbound voice notes/audio via Voicebox Whisper; `0` = pass raw audio with `--file` |
 | `VOICEBOX_STT_MODEL` | empty (= server default) | Whisper size: `base`/`small`/`medium`/`large`/`turbo` |
 | `VOICEBOX_LANGUAGE` | empty (= auto) | STT language hint, e.g. `en` |
@@ -112,7 +113,7 @@ Full async voice loop backed by Voicebox (`VOICEBOX_URL`, on by default — no `
 
 Spoken delivery, in order of preference:
 
-1. **Voice channel (servers):** sit in a VC and send `!join` (`!oc !join` / `@bot !join`). Replies play live, queued serially — no file to click. `!leave` disconnects. DMs have no VC, so they always use files.
+1. **Voice channel (servers):** sit in a VC and send `!join` (`!oc !join` / `@bot !join`). Replies stream sentence-by-sentence (first audio starts while later sentences still generate) and queue serially — no file to click. `!leave` disconnects. DMs have no VC, so they always use files.
 2. **`reply.wav` file:** when not joined (or in DMs), the spoken reply attaches to the channel.
 
 Per-chat control: `!voice off` mutes spoken replies entirely (VC or file), `!voice on` re-enables; `!voice` shows state. TTS failure never blocks the text reply.

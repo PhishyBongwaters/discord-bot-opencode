@@ -41,6 +41,8 @@ Config via env (or .env in cwd / ~/.config/opencode-discord/):
                         "0" = text-only unless a chat opts in with `!voice on`
     VOICEBOX_TIMEOUT    seconds per TTS request (default 120)
     VOICEBOX_MAX_CHARS  max chars sent to TTS per turn (default 1200, rest stays text-only)
+    VC_CHUNK_CHARS      max chars per spoken chunk when streaming to VC
+                        (default 400; smaller = first audio sooner)
     VOICEBOX_TRANSCRIBE "1" = transcribe inbound voice notes/audio via Voicebox
                         Whisper before opencode sees them (default "1"); "0" keeps
                         the old behavior (raw audio passed with --file)
@@ -713,9 +715,14 @@ def tts_wav(reply_text):
     """Blocking Voicebox TTS. Returns wav bytes or None (never raises)."""
     if not VOICEBOX_URL:
         return None
-    text = clean_for_tts(reply_text or "")
-    if not text:
+    return tts_wav_clean(clean_for_tts(reply_text or ""))
+
+
+def tts_wav_clean(text):
+    """Blocking Voicebox TTS of pre-cleaned text. None on any failure."""
+    if not VOICEBOX_URL or not (text or "").strip():
         return None
+    text = text.strip()
     pid = get_voicebox_profile_id()
     if not pid:
         return None
@@ -822,6 +829,39 @@ def transcribe_audio_file(path):
     log.info("voicebox STT: %s (%.1fs) -> %d chars",
              filename, duration, len(text))
     return text, duration
+
+
+VC_CHUNK_CHARS = _env_int("VC_CHUNK_CHARS", 400)
+
+
+def split_sentences(text, max_len=None):
+    """Split speech text into <=max_len chunks at sentence boundaries."""
+    if max_len is None or max_len <= 0:
+        max_len = VC_CHUNK_CHARS
+    cleaned = (text or "").strip()
+    if not cleaned:
+        return []
+    parts = re.split(r"(?<=[.!?])\s+", cleaned)
+    chunks, cur = [], ""
+    for p in parts:
+        p = p.strip()
+        if not p:
+            continue
+        if len(cur) + len(p) + 1 <= max_len:
+            cur = (cur + " " + p).strip()
+        else:
+            if cur:
+                chunks.append(cur)
+            while len(p) > max_len:
+                cut = p[:max_len]
+                i = cut.rfind(" ")
+                i = i if i > max_len // 2 else max_len
+                chunks.append(p[:i].strip())
+                p = p[i:].strip()
+            cur = p
+    if cur:
+        chunks.append(cur)
+    return chunks or [cleaned[:max_len]]
 
 
 def ensure_opus():
@@ -1173,6 +1213,26 @@ async def deliver_reply(key, channel, messages, reply, inbox, status):
             log.exception("[%s] reply-to-file failed, chunking instead", key)
             reply_file = None
 
+    # --- voice pre-flight: start TTS while the text posts (overlap) ---
+    # VC connected -> stream sentence chunks (first audio ASAP).
+    # Otherwise -> one wav attached as reply.wav.
+    voice_task = None
+    voice_chunks = None
+    voice_stream = False
+    if voice_enabled(key) and voice_text.strip():
+        guild = getattr(channel, "guild", None)
+        if guild is not None:
+            vc = guild_voice_client(guild.id)
+            voice_stream = vc is not None and vc.is_connected()
+        if voice_stream:
+            voice_chunks = split_sentences(clean_for_tts(voice_text))
+            if voice_chunks:
+                voice_task = asyncio.ensure_future(
+                    asyncio.to_thread(tts_wav_clean, voice_chunks[0]))
+        else:
+            voice_task = asyncio.ensure_future(
+                asyncio.to_thread(tts_wav, voice_text))
+
     try:
         first = True
         for part in split_smart(reply, MAX_DISCORD):
@@ -1205,22 +1265,40 @@ async def deliver_reply(key, channel, messages, reply, inbox, status):
                 await channel.send(f"(failed to attach {p.name}: {e})")
         # --- voice reply: spoken version of the same text via Voicebox ---
         # Text is always delivered above; TTS failure never blocks it.
-        # Guild VC connected -> spoken in the channel (no file to click).
+        # Guild VC connected -> sentence chunks stream into the channel
+        # (first audio ASAP, no file to click).
         # Otherwise (DMs, not joined) -> reply.wav attaches as before.
-        if voice_enabled(key) and voice_text.strip():
+        if voice_task is not None:
             try:
-                async with channel.typing():
-                    wav = await asyncio.to_thread(tts_wav, voice_text)
-                if wav:
-                    if len(wav) > MAX_ATTACH_MB * 1024 * 1024:
-                        log.warning("[%s] voice reply too big: %d bytes",
-                                    key, len(wav))
-                        wav = None
-                if wav:
+                if voice_stream and voice_chunks:
                     guild = getattr(channel, "guild", None)
-                    played = (await vc_say(guild.id, wav, inbox)
-                              if guild is not None else False)
-                    if not played:
+                    gid = guild.id if guild is not None else None
+                    first = await voice_task
+                    rest = voice_chunks[1:]
+                    if first and gid is not None:
+                        if not await vc_say(gid, first, inbox):
+                            log.warning("[%s] VC gone mid-reply, "
+                                        "dropping voice", key)
+                            rest = []
+                        else:
+                            log.info("[%s] streaming voice: %d chunk(s), "
+                                     "first %d bytes", key, len(voice_chunks),
+                                     len(first))
+                    for chunk in rest:
+                        wav = await asyncio.to_thread(tts_wav_clean, chunk)
+                        if wav and gid is not None:
+                            if not await vc_say(gid, wav, inbox):
+                                log.warning("[%s] VC gone mid-reply, "
+                                            "dropping voice", key)
+                                break
+                else:
+                    wav = await voice_task
+                    if wav:
+                        if len(wav) > MAX_ATTACH_MB * 1024 * 1024:
+                            log.warning("[%s] voice reply too big: %d bytes",
+                                        key, len(wav))
+                            wav = None
+                    if wav:
                         log.info("[%s] uploading voice reply (%d bytes)",
                                  key, len(wav))
                         await channel.send(file=discord.File(
@@ -1229,6 +1307,8 @@ async def deliver_reply(key, channel, messages, reply, inbox, status):
                 log.exception("[%s] voice reply send failed", key)
     except Exception:
         log.exception("[%s] reply send failed", key)
+        if voice_task is not None and not voice_task.done():
+            voice_task.cancel()
         for m in messages:
             await swap_react(m, REACT_START, REACT_ERROR)
         return
