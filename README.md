@@ -7,7 +7,7 @@ Two-way chat between Discord and opencode. DM the bot, it forwards to `opencode 
 - `!new`: start a fresh opencode session (plain message with `!`, **not** `/new` — there are no slash commands)
 - `!status`: session id, model, voice/VC state, say-queue pending, turns, tokens, cost, inbox, queue state
 - `!voice [on|off]`: spoken replies via Voicebox (Computer voice); `!join` / `!leave`: speak replies in your voice channel (servers)
-- `!say <text>`: speak a line in VC now, no opencode call; `!voiceready`: readiness check (voicebox + discord + VC + you-in-VC)
+- `!say <text>`: speak a line in VC now, no opencode call; `!skip`: stop the current VC clip and drop the queue (stays connected); `!voiceready`: readiness check (voicebox + discord + VC + you-in-VC)
 - `!model`: show current + available; `!model provider/name` to switch, `!model clear` to reset
 - `!cancel`: stop the in-flight opencode run for this chat (repeat if a follow-up started; no-op when idle)
 - `/sessions`: dropdown browser to switch opencode sessions (servers; DMs after global sync)
@@ -93,7 +93,8 @@ Two-way chat between Discord and opencode. DM the bot, it forwards to `opencode 
 
 - **Reacts:** hourglass on your message means it's accepted and working; check means done; cross means something failed (details in console).
 - **Coalescing:** if you send more messages while a turn is running, they merge into a single follow-up turn (separated by `---`) instead of one run each. The follow-up reply covers everything merged. To force separate turns, wait for the check react first.
-- **Cancel:** `!cancel` kills the in-flight opencode run for that chat, drops queued follow-ups, posts `cancelled ...`, and flips reacts to cross. One `!cancel` kills the current run — if a follow-up already started, send it again. If the turn already reached the reply/voice stage there's no subprocess left, so `!cancel` only drops queued messages and says so. Other chats are unaffected, and voice-channel playback is never stopped.
+- **Cancel:** `!cancel` kills the in-flight opencode run for that chat, drops queued follow-ups, posts `cancelled ...`, and flips reacts to cross. One `!cancel` kills the current run — if a follow-up already started, send it again. If the turn already reached the reply/voice stage there's no subprocess left, so `!cancel` only drops queued messages and says so. Other chats are unaffected, and voice-channel playback is never stopped (use `!skip` for that).
+- **Skip:** `!skip` stops the current voice-channel clip, drops the queued clips, and abandons in-flight TTS for that server, then posts `skipped ...`. The bot stays connected (this is not `!leave`). Idle with nothing queued posts `nothing playing.`; in DMs or when not in a voice channel it posts `not in a voice channel.` Other servers are unaffected.
 - **Presence:** Listening while idle, DND "working..." while any turn runs.
 - **Usage:** per-turn tokens/cost logged; `!status` shows session totals (in-memory, resets on restart).
 - **Guild sessions are shared:** everyone talking to the bot in one channel shares that channel's opencode session. Replies thread under your message.

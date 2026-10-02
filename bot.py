@@ -1077,8 +1077,10 @@ def ensure_opus():
     return False
 
 
-VC_QUEUES = {}  # guild_id -> asyncio.Queue[bytes]
+VC_QUEUES = {}  # guild_id -> asyncio.Queue[(epoch, tmppath)]
 VC_PLAYERS = {}  # guild_id -> asyncio.Task
+VC_EPOCHS = {}  # guild_id -> int generation counter; bumped by !skip
+VC_STREAMS = {}  # guild_id -> int active VC turn-stream deliveries
 
 
 def guild_voice_client(guild_id):
@@ -1090,8 +1092,20 @@ async def vc_player(guild_id):
     """Serial playback loop: one wav file at a time through the guild's VC."""
     q = VC_QUEUES[guild_id]
     while True:
-        tmppath = await q.get()
+        item = await q.get()
         try:
+            if isinstance(item, tuple):
+                epoch, tmppath = item
+            else:
+                epoch, tmppath = VC_EPOCHS.get(guild_id, 0), item
+            if epoch != VC_EPOCHS.get(guild_id, 0):
+                log.info("[guild:%s] VC dropping stale clip from prior epoch",
+                         guild_id)
+                try:
+                    os.unlink(tmppath)
+                except OSError:
+                    pass
+                continue
             vc = guild_voice_client(guild_id)
             if vc is None or not vc.is_connected():
                 log.info("[guild:%s] VC gone, dropping queued clip", guild_id)
@@ -1128,10 +1142,16 @@ async def vc_player(guild_id):
             q.task_done()
 
 
-async def vc_say(guild_id, wav, inbox):
-    """Queue wav bytes for VC playback. Returns False when not connected."""
+async def vc_say(guild_id, wav, inbox, epoch=None):
+    """Queue wav bytes for VC playback. Returns False when not connected
+    or when epoch mismatches (stale producer abandoned by !skip)."""
     vc = guild_voice_client(guild_id)
     if vc is None or not vc.is_connected():
+        return False
+    cur = VC_EPOCHS.get(guild_id, 0)
+    if epoch is not None and epoch != cur:
+        log.info("[guild:%s] VC abandoning stale chunk (epoch %d != %d)",
+                 guild_id, epoch, cur)
         return False
     try:
         fd, tmppath = tempfile.mkstemp(
@@ -1146,7 +1166,7 @@ async def vc_say(guild_id, wav, inbox):
         q = asyncio.Queue()
         VC_QUEUES[guild_id] = q
         VC_PLAYERS[guild_id] = asyncio.ensure_future(vc_player(guild_id))
-    q.put_nowait(tmppath)
+    q.put_nowait((cur, tmppath))
     return True
 
 
@@ -1158,9 +1178,10 @@ def vc_drop(guild_id):
     n = 0
     while not q.empty():
         try:
-            tmppath = q.get_nowait()
+            item = q.get_nowait()
         except asyncio.QueueEmpty:
             break
+        tmppath = item[1] if isinstance(item, tuple) else item
         try:
             os.unlink(tmppath)
         except OSError:
@@ -1423,6 +1444,7 @@ async def deliver_reply(key, channel, messages, reply, inbox, status):
     voice_task = None
     voice_chunks = None
     voice_stream = False
+    voice_epoch = None
     say_chunks = [c for s in say_lines
                   for c in split_sentences(clean_for_tts(s))]
     if voice_enabled(key) and (voice_text.strip() or say_chunks):
@@ -1434,6 +1456,8 @@ async def deliver_reply(key, channel, messages, reply, inbox, status):
             voice_chunks = say_chunks + split_sentences(
                 clean_for_tts(voice_text))
             if voice_chunks:
+                voice_epoch = VC_EPOCHS.get(guild.id, 0)
+                VC_STREAMS[guild.id] = VC_STREAMS.get(guild.id, 0) + 1
                 voice_task = asyncio.ensure_future(
                     asyncio.to_thread(tts_wav_clean, voice_chunks[0]))
         else:
@@ -1482,24 +1506,45 @@ async def deliver_reply(key, channel, messages, reply, inbox, status):
                 if voice_stream and voice_chunks:
                     guild = getattr(channel, "guild", None)
                     gid = guild.id if guild is not None else None
-                    first = await voice_task
-                    rest = voice_chunks[1:]
-                    if first and gid is not None:
-                        if not await vc_say(gid, first, inbox):
-                            log.warning("[%s] VC gone mid-reply, "
-                                        "dropping voice", key)
+                    try:
+                        first = await voice_task
+                        rest = voice_chunks[1:]
+                        if (gid is not None and voice_epoch is not None
+                                and voice_epoch != VC_EPOCHS.get(gid, 0)):
+                            log.info("[%s] VC stream skipped, "
+                                     "abandoning %d chunk(s)", key,
+                                     len(voice_chunks))
                             rest = []
-                        else:
-                            log.info("[%s] streaming voice: %d chunk(s), "
-                                     "first %d bytes", key, len(voice_chunks),
-                                     len(first))
-                    for chunk in rest:
-                        wav = await asyncio.to_thread(tts_wav_clean, chunk)
-                        if wav and gid is not None:
-                            if not await vc_say(gid, wav, inbox):
-                                log.warning("[%s] VC gone mid-reply, "
+                            first = None
+                        if first and gid is not None:
+                            if not await vc_say(gid, first, inbox,
+                                                voice_epoch):
+                                log.warning("[%s] VC gone or skipped mid-reply, "
                                             "dropping voice", key)
+                                rest = []
+                            else:
+                                log.info("[%s] streaming voice: %d chunk(s), "
+                                         "first %d bytes", key,
+                                         len(voice_chunks), len(first))
+                        for chunk in rest:
+                            if (gid is not None and voice_epoch is not None
+                                    and voice_epoch
+                                    != VC_EPOCHS.get(gid, 0)):
+                                log.info("[%s] VC stream skipped mid-turn, "
+                                         "abandoning remaining chunks", key)
                                 break
+                            wav = await asyncio.to_thread(tts_wav_clean,
+                                                          chunk)
+                            if wav and gid is not None:
+                                if not await vc_say(gid, wav, inbox,
+                                                    voice_epoch):
+                                    log.warning("[%s] VC gone or skipped mid-reply, "
+                                                "dropping voice", key)
+                                    break
+                    finally:
+                        if gid is not None:
+                            VC_STREAMS[gid] = max(
+                                0, VC_STREAMS.get(gid, 1) - 1)
                 else:
                     wav = await voice_task
                     if wav:
@@ -1518,6 +1563,10 @@ async def deliver_reply(key, channel, messages, reply, inbox, status):
         log.exception("[%s] reply send failed", key)
         if voice_task is not None and not voice_task.done():
             voice_task.cancel()
+        if voice_stream and voice_epoch is not None:
+            _g = getattr(channel, "guild", None)
+            if _g is not None:
+                VC_STREAMS[_g.id] = max(0, VC_STREAMS.get(_g.id, 1) - 1)
         for m in messages:
             await swap_react(m, REACT_START, REACT_ERROR)
         return
@@ -1969,6 +2018,8 @@ async def on_message(message):
             "`!voice [on|off]` - spoken replies via Voicebox (Computer voice)\n"
             "`!join` / `!leave` - speak replies in your voice channel (servers)\n"
             "`!say <text>` - speak a line in VC now, no opencode call\n"
+            "`!skip` - stop the current VC clip and drop the queue "
+            "(stays connected)\n"
             "`!voiceready` - check voicebox + discord + VC + you-in-VC\n"
             "`!cancel` - stop the running turn (kills this run; send again "
             "if a follow-up started)\n"
@@ -2122,6 +2173,35 @@ async def on_message(message):
         except Exception as e:
             log.exception("[%s] VC leave failed", key)
             await message.channel.send(f"could not leave: {e}")
+        return
+
+    if content.lower() == "!skip":
+        guild = getattr(message, "guild", None)
+        vc = guild.voice_client if guild is not None else None
+        if vc is None or not vc.is_connected():
+            await message.channel.send("not in a voice channel.")
+            return
+        gid = guild.id
+        VC_EPOCHS[gid] = VC_EPOCHS.get(gid, 0) + 1
+        try:
+            was_playing = bool(vc.is_playing())
+        except Exception:
+            was_playing = False
+        q = VC_QUEUES.get(gid)
+        pending = q.qsize() if q is not None else 0
+        streaming = VC_STREAMS.get(gid, 0) > 0
+        try:
+            vc.stop()
+        except Exception:
+            pass
+        vc_drop(gid)
+        log.info("[%s] VC skip: stopped=%s dropped=%d", key,
+                 was_playing, pending)
+        if was_playing or pending or streaming:
+            extra = f" ({pending} queued dropped)" if pending else ""
+            await message.channel.send(f"skipped.{extra}")
+        else:
+            await message.channel.send("nothing playing.")
         return
 
     if content.lower() == "!say" or content.lower().startswith("!say "):
