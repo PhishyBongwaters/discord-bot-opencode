@@ -8,3 +8,5 @@ say_queue/
 # Local Opus voice library (Windows). Not in pip; see OPUS_LIB in bot.py.
 libopus-0.x64.dll
 opus.dll
+# Local-only voice-mode flag (presence = agent voice mode on).
+.opencode/voice-mode.on
