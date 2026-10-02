@@ -72,6 +72,11 @@ screen-share: human replies go to voice, technical work stays in text.
 - **Text (chat reply):** everything technical — code blocks, diffs, logs,
   exact commands, config values, file paths.
 - Never read text content aloud verbatim; paraphrase the human meaning.
+- Approvals first: before any action likely to raise a permission/approval
+  gate, speak a one-line heads-up (what + why), then act. The gate itself
+  still appears in text/UI as normal — voice announces it, never replaces
+  it. TTS lags a few seconds behind, so keep the line short and let the
+  text prompt carry the detail.
 - "Voice mode off" or deleting the flag file returns to text-only replies
   (turn replies still follow the bot's own `!voice` setting).
 
