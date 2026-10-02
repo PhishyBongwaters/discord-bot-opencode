@@ -82,6 +82,7 @@ Two-way chat between Discord and opencode. DM the bot, it forwards to `opencode 
 | `VC_AUTOJOIN` | empty (= disabled) | Voice channel id to join on startup and sit in until restart |
 | `VC_AUTOREJOIN` | `1` | `1` = rejoin the autojoin channel if disconnected unexpectedly (`!leave` still sticks) |
 | `VOICEBOX_WARMUP` | `1` | `1` = one silent TTS at startup so the first real reply skips model-load cost |
+| `VOICE_USER_ID` | empty (= skip) | Your Discord user id; `!voiceready` checks you're sitting in the VC with the bot |
 
 `sample.env` shows the same knobs.
 
@@ -120,6 +121,10 @@ Spoken delivery, in order of preference:
 Per-chat control: `!voice off` mutes spoken replies entirely (VC or file), `!voice on` re-enables; `!voice` shows state. TTS failure never blocks the text reply.
 
 **Staying in VC:** set `VC_AUTOJOIN` to a voice channel id and the bot joins it on startup and sits there until restart (`VC_AUTOREJOIN=1` rejoins after unexpected drops; `!leave` is still respected and sticks). Find the id by right-clicking the channel → Copy Channel ID (Developer Mode on).
+
+**Readiness gate:** `!voiceready` checks all four preconditions and reports `OK`/`FAIL` per line: Voicebox reachable (with ping ms), Discord gateway connected, bot in a VC, and you in the same VC (needs `VOICE_USER_ID` set, else skipped). Run it before a voice session instead of guessing.
+
+**Fail-safe auto-off:** 3 consecutive Voicebox *connection* failures (unreachable/down — not HTTP errors, which mean it's alive) delete the `.opencode/voice-mode.on` flag and log `voice mode auto-disabled`. Say `voice mode on` to re-enable once Voicebox is back. The bot can only detect this while running, so a dead gateway (bot itself down) just means no voice at all until restart.
 
 **Say-queue (agent-initiated speech):** the bot watches `SAY_DIR` (default `say_queue/`) every `SAY_POLL` seconds. Drop in a `.txt` file and it speaks it in VC via the same Computer voice — no Discord message needed, no opencode call. Plain `*.txt` plays in every connected VC; `<guildid>_*.txt` targets one server. Files are deleted after speaking; if no VC is connected they're held until one is (TTS failures retry with backoff). This is the path for speaking *from* a shell/agent session: anything that can write a file (including opencode itself mid-turn, or another harness) can make the bot talk. `!say <text>` is the same thing from Discord chat. `!status` shows pending say files.
 

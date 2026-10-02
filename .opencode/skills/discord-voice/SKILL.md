@@ -37,6 +37,19 @@ itself is confirmed in the bot log (`speaking ...vc-*.wav`, then the
 ffmpeg process terminating with code 0). If the file sits unprocessed,
 no VC is connected (`!join` / check `VC_AUTOJOIN`).
 
+## Readiness gate
+
+Before a voice session (or before the first voice drop of your own
+session), confirm all four preconditions — in Discord: `!voiceready`.
+It reports one `OK`/`FAIL` line each for: Voicebox reachable, Discord
+gateway connected, bot in a VC, and you in the same VC with the bot
+(the last needs `VOICE_USER_ID` set in the bot env, else skipped).
+
+Fail-safe: 3 consecutive Voicebox connection failures auto-delete
+`.opencode/voice-mode.on` and log `voice mode auto-disabled`. Re-enable
+with `voice mode on` once Voicebox is back. A dead gateway needs no
+toggle — a down bot simply produces no voice until restarted.
+
 ## Speak from Discord chat
 
 - `!say <text>` — speaks immediately in VC, no opencode call.

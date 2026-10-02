@@ -62,6 +62,8 @@ Config via env (or .env in cwd / ~/.config/opencode-discord/):
                         unexpectedly (default "1"; `!leave` still sticks)
     VOICEBOX_WARMUP     "1" = one silent TTS at startup so the first real reply
                         doesn't pay model-load cost (default "1")
+    VOICE_USER_ID       your Discord user id; used by `!voiceready` to check
+                        you're actually sitting in the VC (empty disables that check)
 
     Voice channels (guilds only, text stays the input):
     `!join` pulls the bot into your current voice channel; every voice-enabled
@@ -177,6 +179,7 @@ SAY_MAX_BYTES = _env_int("SAY_MAX_BYTES", 8192)
 VC_AUTOJOIN = os.environ.get("VC_AUTOJOIN", "").strip()
 VC_AUTOREJOIN = os.environ.get("VC_AUTOREJOIN", "1") == "1"
 VOICEBOX_WARMUP = os.environ.get("VOICEBOX_WARMUP", "1") == "1"
+VOICE_USER_ID = os.environ.get("VOICE_USER_ID", "").strip()
 
 logging.basicConfig(
     level=getattr(logging, LOG_LEVEL, logging.INFO),
@@ -645,6 +648,106 @@ def voice_enabled(key):
     return VOICEBOX_VOICE
 
 
+VOICE_MODE_FLAG = Path(__file__).resolve().parent / ".opencode" / "voice-mode.on"
+
+
+def voice_mode_on():
+    return VOICE_MODE_FLAG.is_file()
+
+
+def voice_mode_off(reason):
+    """Fail-safe: disable agent voice mode. Returns True if it was on."""
+    try:
+        if VOICE_MODE_FLAG.is_file():
+            VOICE_MODE_FLAG.unlink()
+            log.warning("voice mode auto-disabled: %s", reason)
+            return True
+    except OSError as e:
+        log.warning("voice mode auto-disable failed: %s", e)
+    return False
+
+
+# Consecutive Voicebox connection failures (reachable-but-error HTTP
+# responses don't count — only down/unreachable). Trips the auto-off.
+VOICEBOX_FAILS = {"n": 0}
+VOICEBOX_FAIL_LIMIT = 3
+
+
+def note_voicebox_result(ok):
+    if ok:
+        VOICEBOX_FAILS["n"] = 0
+        return
+    VOICEBOX_FAILS["n"] += 1
+    if VOICEBOX_FAILS["n"] >= VOICEBOX_FAIL_LIMIT and voice_mode_on():
+        voice_mode_off(
+            f"Voicebox unreachable ({VOICEBOX_FAILS['n']}x) - "
+            "say `voice mode on` to re-enable once it's back")
+
+
+def voicebox_ping(timeout=5):
+    """Fast reachability probe. Returns (ok, detail_ms_or_error)."""
+    import time as _t
+    if not VOICEBOX_URL:
+        return False, "VOICEBOX_URL empty (voice disabled)"
+    t0 = _t.monotonic()
+    try:
+        req = urllib.request.Request(
+            f"{VOICEBOX_URL}/profiles",
+            headers={"X-Voicebox-Client-Id": "discord-bot"})
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            r.read(64)
+    except Exception as e:
+        return False, f"{type(e).__name__}: {e}"[:160]
+    return True, f"{(_t.monotonic() - t0) * 1000:.0f}ms"
+
+
+async def voice_ready():
+    """Readiness gate. Returns [(label, ok, detail)]. Never raises."""
+    results = []
+    ok, detail = await asyncio.to_thread(voicebox_ping)
+    results.append(("voicebox", ok, detail))
+    results.append(("discord", client.is_ready(),
+                    f"logged in as {client.user}" if client.is_ready()
+                    else "not connected"))
+    live = connected_guild_ids()
+    results.append(("bot-vc", bool(live),
+                    f"in {len(live)} VC(s)" if live
+                    else "not in any voice channel (`!join`)"))
+    if VOICE_USER_ID:
+        try:
+            uid = int(VOICE_USER_ID)
+        except ValueError:
+            results.append(("you-in-vc", False,
+                            f"VOICE_USER_ID invalid ({VOICE_USER_ID!r})"))
+            uid = None
+        if uid is not None:
+            where = None
+            for gid in live:
+                g = client.get_guild(gid)
+                if g is None:
+                    continue
+                try:
+                    m = g.get_member(uid) or await g.fetch_member(uid)
+                except Exception as e:
+                    where = f"lookup failed: {e}"[:120]
+                    continue
+                vs = getattr(m, "voice", None)
+                if vs is not None and vs.channel is not None:
+                    vc = g.voice_client
+                    same = vc is not None and vc.channel is not None \
+                        and vc.channel.id == vs.channel.id
+                    where = (f"in #{vs.channel.name}"
+                             f"{' (with bot)' if same else ' (NOT with bot)'}")
+                    if same:
+                        break
+            results.append(("you-in-vc", where is not None
+                            and "(with bot)" in where,
+                            where or "not in any voice channel"))
+    else:
+        results.append(("you-in-vc", True, "skipped (VOICE_USER_ID empty)"))
+    return results
+
+
 def clean_for_tts(reply):
     """Strip markers/markdown the listener should never hear. Truncated."""
     text, _ = split_attach_markers(reply)
@@ -744,14 +847,17 @@ def tts_wav_clean(text):
         except Exception:
             detail = ""
         log.warning("voicebox TTS http %s: %s", e.code, detail)
+        note_voicebox_result(True)  # reachable, refused for cause
         return None
     except Exception as e:
         log.warning("voicebox TTS failed: %s", e)
+        note_voicebox_result(False)  # unreachable -> counts toward auto-off
         return None
     if len(body) < 1000:
         log.warning("voicebox TTS returned %d bytes (not audio?)", len(body))
         return None
     log.info("voicebox TTS: %d chars -> %d bytes", len(text), len(body))
+    note_voicebox_result(True)
     return body
 
 
@@ -814,9 +920,11 @@ def transcribe_audio_file(path):
             except Exception:
                 detail = ""
             log.warning("voicebox STT http %s: %s", e.code, detail)
+            note_voicebox_result(True)  # reachable, refused for cause
             return None, None
         except Exception as e:
             log.warning("voicebox STT failed: %s", e)
+            note_voicebox_result(False)  # unreachable -> counts toward auto-off
             return None, None
         text = (obj.get("text") or "").strip() if isinstance(obj, dict) else ""
         if text or attempt == 2:
@@ -831,6 +939,7 @@ def transcribe_audio_file(path):
         return None, None
     log.info("voicebox STT: %s (%.1fs) -> %d chars",
              filename, duration, len(text))
+    note_voicebox_result(True)
     return text, duration
 
 
@@ -1701,6 +1810,7 @@ async def on_message(message):
             "`!voice [on|off]` - spoken replies via Voicebox (Computer voice)\n"
             "`!join` / `!leave` - speak replies in your voice channel (servers)\n"
             "`!say <text>` - speak a line in VC now, no opencode call\n"
+            "`!voiceready` - check voicebox + discord + VC + you-in-VC\n"
             f"`{GUILD_PREFIX} <prompt>` - use me in a server channel\n"
             "Attach + `place this in <dir>` saves files directly.\n"
             "`send me <path>` sends a file back directly.\n"
@@ -1874,6 +1984,19 @@ async def on_message(message):
         log.info("[%s] !say queued for %d guild(s): %r", key, n, line[:80])
         await message.channel.send(
             f"saying it in {n} voice channel(s).")
+        return
+
+    if content.lower() == "!voiceready":
+        results = await voice_ready()
+        lines = []
+        for label, ok, detail in results:
+            lines.append(f"{'OK ' if ok else 'FAIL'} `{label}`: {detail}")
+        allok = all(ok for _, ok, _ in results)
+        lines.append("voice ready." if allok else
+                     "NOT voice ready - fix the FAIL lines above.")
+        log.info("[%s] voiceready: %s",
+                 key, "; ".join(f"{l}={o}" for l, o, _ in results))
+        await message.channel.send("\n".join(lines))
         return
 
     if content.lower() == "!model" or content.lower().startswith("!model "):
