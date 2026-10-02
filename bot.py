@@ -23,6 +23,9 @@ Config via env (or .env in cwd / ~/.config/opencode-discord/):
     ALLOWED_USER_IDS    comma-separated Discord user ids; empty = anyone (warns)
     OPENCODE_BIN        default "opencode"
     OPENCODE_DIR        working dir for opencode runs (default cwd)
+    FILE_JAIL         allowlist root for drop targets + send sources
+                      (default OPENCODE_DIR; empty also fails closed to
+                      OPENCODE_DIR). DMs and guilds share the same rule.
     OPENCODE_MODEL      optional, passed as -m
     OPENCODE_AGENT      optional, passed as --agent
     OPENCODE_AUTO       "1" to pass --auto (auto-approve tools). Default "0".
@@ -155,6 +158,17 @@ ALLOWED = {u.strip() for u in os.environ.get("ALLOWED_USER_IDS", "").split(",")
            if u.strip()}
 OPENCODE_BIN = os.environ.get("OPENCODE_BIN", "opencode")
 OPENCODE_DIR = os.environ.get("OPENCODE_DIR", os.getcwd())
+FILE_JAIL_RAW = os.environ.get("FILE_JAIL", "").strip()
+# Fail-closed: unset or empty FILE_JAIL jails to OPENCODE_DIR. There is
+# deliberately no unlimited mode.
+try:
+    FILE_JAIL = Path(FILE_JAIL_RAW or OPENCODE_DIR).expanduser().resolve()
+except OSError:
+    FILE_JAIL = Path(os.path.abspath(
+        os.path.expanduser(FILE_JAIL_RAW or OPENCODE_DIR)))
+if not FILE_JAIL_RAW:
+    print(f"FILE_JAIL empty/unset - jailing file drop/send "
+          f"to OPENCODE_DIR ({FILE_JAIL})", file=sys.stderr)
 OPENCODE_MODEL = os.environ.get("OPENCODE_MODEL", "").strip()
 OPENCODE_AGENT = os.environ.get("OPENCODE_AGENT", "").strip()
 OPENCODE_AUTO = os.environ.get("OPENCODE_AUTO", "0") == "1"
@@ -200,6 +214,7 @@ logging.basicConfig(
     stream=sys.stderr,
 )
 log = logging.getLogger("discord-bot")
+log.info("file jail: %s", FILE_JAIL)
 
 # Explicit drop: "place/put/save/drop/move/copy this in(to) <path>"
 # Handled directly by the bot (filesystem move) without involving opencode,
@@ -219,10 +234,75 @@ SEND_RE = re.compile(
     re.IGNORECASE,
 )
 
-def resolve_target_dir(path_str):
-    p = Path(path_str.strip().strip("'\"")).expanduser()
+
+class JailViolation(Exception):
+    """A user/model-specified path resolves outside FILE_JAIL."""
+    def __init__(self, raw, resolved):
+        self.raw = raw
+        self.resolved = resolved
+        super().__init__(f"path outside file jail: {raw!r} -> {resolved}")
+
+
+def _strip_extended_prefix(s):
+    # \\?\C:\x -> C:\x ; \\?\UNC\host\share -> \\host\share
+    if s.startswith("\\\\?\\"):
+        rest = s[4:]
+        if rest[:4].upper() == "UNC\\":
+            return "\\\\" + rest[4:]
+        return rest
+    return s
+
+
+def _resolve_candidate(path_str):
+    """Expand ~, anchor relative paths under OPENCODE_DIR, resolve .. and
+    symlinks/junctions as far as the filesystem allows (resolve() handles
+    non-existent tails lexically). Returns (raw, resolved)."""
+    raw = path_str.strip().strip("'\"")
+    p = Path(raw).expanduser()
     if not p.is_absolute():
-        p = (Path(OPENCODE_DIR) / p).resolve()
+        p = Path(OPENCODE_DIR) / p
+    try:
+        resolved = p.resolve()
+    except OSError:
+        resolved = Path(os.path.abspath(str(p)))
+    return raw, resolved
+
+
+def jailed(path: Path) -> bool:
+    """True when a resolved path is inside FILE_JAIL. Fail-closed: any
+    resolution error returns False. Windows comparison is case-insensitive
+    with both separators via normcase; extended-path prefixes stripped."""
+    try:
+        rp = path.resolve()
+    except OSError:
+        try:
+            rp = Path(os.path.abspath(str(path)))
+        except OSError:
+            return False
+    if os.name == "nt":
+        rs = _strip_extended_prefix(os.path.normcase(str(rp)))
+        js = _strip_extended_prefix(os.path.normcase(str(FILE_JAIL)))
+        js = js.rstrip("\\")
+        return rs == js or rs.startswith(js + "\\")
+    try:
+        return rp.is_relative_to(FILE_JAIL)
+    except AttributeError:  # python <3.9
+        try:
+            rp.relative_to(FILE_JAIL)
+            return True
+        except ValueError:
+            return False
+
+
+def jail_error_message(raw):
+    return (f"refused: `{raw}` is outside the file jail (`{FILE_JAIL}`). "
+            "Drop targets and send sources must stay inside it.")
+
+
+def resolve_target_dir(path_str):
+    raw, p = _resolve_candidate(path_str)
+    if not jailed(p):
+        raise JailViolation(raw, p)
     return p
 
 
@@ -819,9 +899,9 @@ def split_say_markers(reply):
 
 
 def resolve_outbound(path_str):
-    p = Path(path_str.strip().strip("'\"")).expanduser()
-    if not p.is_absolute():
-        p = (Path(OPENCODE_DIR) / p).resolve()
+    raw, p = _resolve_candidate(path_str)
+    if not jailed(p):
+        raise JailViolation(raw, p)
     return p
 
 
@@ -1503,7 +1583,19 @@ async def deliver_reply(key, channel, messages, reply, inbox, status):
     errors = []
     outbound = []
     for pstr in out_paths:
-        p = resolve_outbound(pstr)
+        try:
+            p = resolve_outbound(pstr)
+        except JailViolation as e:
+            # Loud only for real paths (exfiltration attempt); nonexistent
+            # markers stay silent-skipped (quoted doc examples must not spam).
+            if e.resolved.exists():
+                log.warning("[%s] outbound refused (outside file jail): "
+                            "%r -> %s", key, e.raw, e.resolved)
+                errors.append(jail_error_message(e.raw))
+            else:
+                log.info("[%s] outbound marker outside jail, no such file, "
+                         "skipping: %r", key, pstr)
+            continue
         log.info("[%s] outbound: %r -> %s", key, pstr, p)
         if not p.is_file():
             # Silent skip, not a user error: doc examples ([[attach:path]],
@@ -2432,22 +2524,35 @@ async def on_message(message):
     # --- direct send: "send me <path>" uploads without opencode ---
     send = SEND_RE.match(content) if not message.attachments else None
     if send:
-        p = resolve_outbound(send.group(1))
-        log.info("[%s] direct send: %r -> %s", key, send.group(1), p)
-        if p.is_file():
-            if p.stat().st_size > MAX_ATTACH_MB * 1024 * 1024:
+        try:
+            p = resolve_outbound(send.group(1))
+        except JailViolation as e:
+            # Loud only when the path exists (real read); nonexistent
+            # outside-jail text falls through to opencode as normal chat.
+            if e.resolved.exists():
+                log.warning("[%s] direct send refused (outside file jail): "
+                            "%r -> %s", key, e.raw, e.resolved)
                 await swap_react(message, REACT_START, REACT_ERROR)
-                await message.channel.send(
-                    f"could not send `{p.name}`: exceeds {MAX_ATTACH_MB:g}MB limit")
+                await message.channel.send(jail_error_message(e.raw))
                 return
-            async with message.channel.typing():
-                await message.channel.send(file=discord.File(str(p)))
-            log.info("[%s] direct-sent %s (%d bytes)", key, p, p.stat().st_size)
-            await swap_react(message, REACT_START, REACT_DONE)
-            return
-        # not a file path: fall through to opencode for normal chat
-        # containing the word "send" (e.g. "send me the report summary")
-        log.info("[%s] send pattern but not a file, using opencode: %s", key, p)
+            log.info("[%s] send pattern outside jail, no such file, "
+                     "using opencode: %r", key, send.group(1))
+        else:
+            log.info("[%s] direct send: %r -> %s", key, send.group(1), p)
+            if p.is_file():
+                if p.stat().st_size > MAX_ATTACH_MB * 1024 * 1024:
+                    await swap_react(message, REACT_START, REACT_ERROR)
+                    await message.channel.send(
+                        f"could not send `{p.name}`: exceeds {MAX_ATTACH_MB:g}MB limit")
+                    return
+                async with message.channel.typing():
+                    await message.channel.send(file=discord.File(str(p)))
+                log.info("[%s] direct-sent %s (%d bytes)", key, p, p.stat().st_size)
+                await swap_react(message, REACT_START, REACT_DONE)
+                return
+            # not a file path: fall through to opencode for normal chat
+            # containing the word "send" (e.g. "send me the report summary")
+            log.info("[%s] send pattern but not a file, using opencode: %s", key, p)
 
     status = None
     if message.attachments:
@@ -2525,7 +2630,19 @@ async def on_message(message):
         # --- direct drop: "place this in <dir>" moves files, no opencode ---
         drop = DROP_RE.match(content) if saved_files else None
         if drop:
-            target = resolve_target_dir(drop.group(1))
+            try:
+                target = resolve_target_dir(drop.group(1))
+            except JailViolation as e:
+                log.warning("[%s] drop refused (outside file jail): %r -> %s",
+                            key, e.raw, e.resolved)
+                if status is not None:
+                    try:
+                        await status.delete()
+                    except Exception:
+                        pass
+                await swap_react(message, REACT_START, REACT_ERROR)
+                await message.channel.send(jail_error_message(e.raw))
+                return
             log.info("[%s] direct drop: %d file(s) -> %s", key, len(saved_files), target)
             try:
                 target.mkdir(parents=True, exist_ok=True)

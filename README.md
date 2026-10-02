@@ -55,6 +55,7 @@ Two-way chat between Discord and opencode. DM the bot, it forwards to `opencode 
 | `ALLOWED_USER_IDS` | empty (= anyone, warns) | Comma-separated Discord user ids |
 | `OPENCODE_BIN` | `opencode` | Path to opencode binary/`.cmd` |
 | `OPENCODE_DIR` | cwd | Working dir for opencode runs; relative attach paths resolve here |
+| `FILE_JAIL` | `OPENCODE_DIR` | Allowlist root for drop targets + send sources; empty also fails closed to `OPENCODE_DIR`. DMs and guilds share the same rule (see Trust model) |
 | `OPENCODE_MODEL` | empty | Passed as `-m`, e.g. `provider/model#variant` |
 | `OPENCODE_AGENT` | empty | Passed as `--agent` |
 | `OPENCODE_AUTO` | `0` | Set `1` to pass `--auto` (auto-approve tools). Required for unattended file moves/writes. Only for users you trust |
@@ -112,6 +113,8 @@ Two-way chat between Discord and opencode. DM the bot, it forwards to `opencode 
 **Outbound via opencode:** the model emits `[[attach:D:\files\clip.mp4]]` on its own line; the bot strips the marker and uploads. Markers pointing at nonexistent files are silently skipped (quoted doc examples must never spam the channel); oversize files come back as text errors. `[[say:Deploy complete.]` (max 3 per turn) is a spoken-only aside — stripped from text, played in VC when live, else folded into `reply.wav`. The model can also react to your message with `[[react:EMOJI]]` (literal emoji, or custom `<:name:id>`; max 5 per turn, invalid ones are skipped with a console warning).
 
 Model-driven moves/writes require `OPENCODE_AUTO=1` (or an agent that can approve file tools).
+
+**Trust model (file jail):** direct drops, direct sends, and model-emitted `[[attach:]]` markers all resolve the user/model-specified side through `FILE_JAIL` (default `OPENCODE_DIR`; empty fails closed to `OPENCODE_DIR` — there is no unlimited mode). `..`, mixed separators, drive-letter case, UNC/extended paths, and symlinks/junctions are resolved first (`Path.resolve()`), then checked — string-prefix bypasses don't work, and the drop handler checks *before* `mkdir` (never creates the refused dir). Outside-jail targets/sources are refused with a chat error and a log line; the same rule applies in DMs and guilds. Inbox paths (`attachments/<key>/`) are bot-managed and unaffected. Loud/silent rule: a jail violation is LOUD (chat error) only when the resolved path exists — a real exfiltration attempt. Nonexistent outside-jail paths stay silent: `[[attach:]]` markers skip as before (quoted doc examples must never spam), and `send me <nonexistent>` falls through to opencode as normal chat.
 
 ## Voice
 
