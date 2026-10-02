@@ -30,7 +30,8 @@ class Coalescing(unittest.TestCase):
     def test_buffer_drains_as_single_followup(self):
         delivered = []  # [(messages, reply)]
 
-        async def fake_deliver(key, channel, messages, reply, inbox, status):
+        async def fake_deliver(key, channel, messages, reply, inbox, status,
+                           reply_author_id=None):
             delivered.append((list(messages), reply))
 
         async def noop(*a, **k):
@@ -72,7 +73,8 @@ class Coalescing(unittest.TestCase):
             seen["prompt"] = prompt
             return "ok", "sid-1"
 
-        async def fake_deliver(key, channel, messages, reply, inbox, status):
+        async def fake_deliver(key, channel, messages, reply, inbox, status,
+                           reply_author_id=None):
             pass
 
         async def noop(*a, **k):

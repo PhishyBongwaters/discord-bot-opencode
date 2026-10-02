@@ -409,6 +409,27 @@ def jail_error_message(raw):
             "Drop targets and send sources must stay inside it.")
 
 
+def _safe_inbox_name(filename):
+    """Collapse a Discord attachment name to a safe (stem, suffix) leaf.
+
+    Discord hands us the raw client-side name: it can contain POSIX or
+    Windows separators, ".." segments, drive prefixes ("C:\\x.png") or be
+    outright absolute. All of those would escape the inbox via
+    ``inbox / att.filename``. We normalize both separator styles, take the
+    final leaf, strip drive prefixes and leading dots (no dotfiles/hidden
+    surprises), and fall back to "file" when nothing survivable remains.
+    Callers still verify ``dest.resolve()`` stays under the inbox."""
+    name = (filename or "").replace("\\", "/")
+    # strip a Windows drive prefix if the leaf somehow keeps one
+    if len(name) > 1 and name[1] == ":" and name[0].isalpha():
+        name = name[2:]
+    leaf = name.rsplit("/", 1)[-1].strip().lstrip(".")
+    if not leaf:
+        leaf = "file"
+    p = Path(leaf)
+    return p.stem, p.suffix
+
+
 def resolve_target_dir(path_str):
     raw, p = _resolve_candidate(path_str)
     if not jailed(p):
@@ -945,7 +966,13 @@ def strip_json_events(ndjson_text):
     return "".join(run_lines(False)).strip()
 
 def run_opencode(prompt, session_key, files=None, model=None):
-    """Run one opencode turn. Returns (reply_text, session_id_or_None)."""
+    """Run one opencode turn. Returns (reply_text, session_id_or_None).
+
+    The prompt travels on stdin, never in argv: Windows caps a command
+    line at 32767 chars and a big coalesced prompt (STT transcripts +
+    attach notes) blows past it, surfacing as a misleading "could not
+    execute opencode" OSError. `opencode run` reads the prompt from
+    stdin when no message args are given."""
     cmd = [OPENCODE_BIN, "run", "--format", "json"]
     session_id = SESSIONS.get(session_key)
     if session_id:
@@ -959,10 +986,10 @@ def run_opencode(prompt, session_key, files=None, model=None):
         cmd += ["--auto"]
     for f in files or []:
         cmd += ["--file", str(f)]
-    cmd += ["--", prompt]
 
-    log.info("[%s] opencode start: session=%s files=%d timeout=%ds cwd=%s",
-             session_key, session_id or "(new)", len(files or []),
+    log.info("[%s] opencode start: session=%s files=%d prompt=%d chars "
+             "timeout=%ds cwd=%s",
+             session_key, session_id or "(new)", len(files or []), len(prompt),
              OPENCODE_TIMEOUT, OPENCODE_DIR)
     log.debug("[%s] cmd: %s", session_key, cmd)
     with TURN_LOCK:
@@ -971,8 +998,8 @@ def run_opencode(prompt, session_key, files=None, model=None):
     t0 = time.monotonic()
     try:
         proc = subprocess.Popen(
-            cmd, cwd=OPENCODE_DIR, stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE, text=True,
+            cmd, cwd=OPENCODE_DIR, stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
             encoding="utf-8", errors="replace")
     except FileNotFoundError:
         log.error("[%s] could not execute %r", session_key, OPENCODE_BIN)
@@ -985,14 +1012,11 @@ def run_opencode(prompt, session_key, files=None, model=None):
     with TURN_LOCK:
         st["proc"] = proc
     try:
-        out, err = proc.communicate(timeout=OPENCODE_TIMEOUT)
+        out, err = proc.communicate(input=prompt, timeout=OPENCODE_TIMEOUT)
     except subprocess.TimeoutExpired:
         with TURN_LOCK:
             cancelled = st.get("cancelled")
-        try:
-            proc.kill()
-        except Exception:
-            pass
+        _kill_proc_tree(proc, session_key)
         try:
             out, err = proc.communicate(timeout=30)
         except Exception:
@@ -1736,6 +1760,17 @@ async def _autoleave_countdown(guild_id, channel_id, delay):
             return
         ch = vc.channel
         if ch is None or ch.id != channel_id:
+            # Bot was moved mid-countdown: the armed channel no longer
+            # applies. Re-evaluate against the new channel instead of
+            # silently disarming — otherwise _arm's running-task no-op at
+            # move time plus this silent exit leaves the bot alone in the
+            # new channel indefinitely. (The finally below won't clobber
+            # the re-armed task thanks to its `is task` guard.)
+            VC_AUTOLEAVE_TASKS.pop(guild_id, None)
+            VC_AUTOLEAVE_AT.pop(guild_id, None)
+            log.info("[guild:%s] VC auto-leave: channel moved, re-arming",
+                     guild_id)
+            _refresh_autoleave(guild_id)
             return
         if _vc_human_count(ch) > 0:
             return
@@ -1878,10 +1913,18 @@ async def process_text_file(path):
     last = TEXT_FAIL_AT.get(str(path), 0.0)
     if now - last < 60:
         return False  # backing off, keep file
-    stamps = TEXT_RATE.setdefault(target, collections.deque())
+    stamps = TEXT_RATE.get(target)
+    if stamps is None:
+        stamps = TEXT_RATE[target] = collections.deque()
     while stamps and now - stamps[0] > 60:
         stamps.popleft()
-    if len(stamps) >= max(TEXT_MAX_PER_MINUTE, 1):
+    if not stamps:
+        # Bucket fully expired while idle: drop the entry so TEXT_RATE
+        # doesn't keep one deque per channel id ever seen. A fresh bucket
+        # is created on the next successful send below.
+        del TEXT_RATE[target]
+        stamps = None
+    if stamps is not None and len(stamps) >= max(TEXT_MAX_PER_MINUTE, 1):
         return False  # over per-channel rate, hold for later
     try:
         ch = client.get_channel(target)
@@ -1897,7 +1940,7 @@ async def process_text_file(path):
         TEXT_FAIL_AT[str(path)] = now
         log.warning("text-queue send to %s failed: %s", target, e)
         return False
-    stamps.append(now)
+    TEXT_RATE.setdefault(target, collections.deque()).append(now)
     TEXT_FAIL_AT.pop(str(path), None)
     return True
 
@@ -2141,9 +2184,16 @@ async def deliver_reply(key, channel, messages, reply, inbox, status,
 
     try:
         first = True
+        # Regen path: messages[0] is the bot's own reply — threading under
+        # it looks odd, so post plain instead. (Working reacts are already
+        # skipped for own messages in react()/swap_react().)
+        regen_source = (
+            bool(messages)
+            and getattr(getattr(messages[0], "author", None), "bot", False))
         for part in split_smart(reply, MAX_DISCORD):
             # guilds: thread the first chunk under the user's message
-            if first and messages and not _is_dm(channel):
+            if first and messages and not regen_source \
+                    and not _is_dm(channel):
                 first = False
                 try:
                     sent = await messages[0].reply(part)
@@ -2259,6 +2309,36 @@ async def deliver_reply(key, channel, messages, reply, inbox, status,
         await swap_react(m, REACT_START, REACT_DONE)
 
 
+def _kill_proc_tree(proc, key):
+    """Terminate a subprocess and, on Windows, its whole tree.
+
+    opencode spawns tool subprocesses; proc.terminate() alone orphans
+    them on Windows (no POSIX process groups). taskkill /T /F kills the
+    tree; on other platforms terminate() then kill() is enough. Never
+    raises — failure just means the TimeoutExpired path in run_opencode
+    reaps whatever is left."""
+    if os.name == "nt":
+        try:
+            subprocess.run(["taskkill", "/PID", str(proc.pid), "/T", "/F"],
+                           capture_output=True, timeout=15)
+            log.info("[%s] taskkill /T /F on pid %d", key, proc.pid)
+            return
+        except Exception as e:
+            log.warning("[%s] taskkill failed, falling back: %s", key, e)
+    try:
+        proc.terminate()
+    except Exception as e:
+        log.warning("[%s] cancel terminate failed: %s", key, e)
+        return
+    try:
+        proc.wait(timeout=10)
+    except Exception:
+        try:
+            proc.kill()
+        except Exception as e:
+            log.warning("[%s] cancel kill failed: %s", key, e)
+
+
 async def cancel_turn(key, channel):
     """Cancel the in-flight opencode run for key.
 
@@ -2285,10 +2365,7 @@ async def cancel_turn(key, channel):
     for m, _, _ in pending:
         await swap_react(m, REACT_START, REACT_ERROR)
     if alive:
-        try:
-            proc.terminate()
-        except Exception as e:
-            log.warning("[%s] cancel terminate failed: %s", key, e)
+        _kill_proc_tree(proc, key)
         n = len(pending)
         extra = (f" (also dropped {n} queued message(s))" if n else "")
         log.info("[%s] turn cancelled by user%s", key, extra)
@@ -2316,8 +2393,13 @@ async def cancel_turn(key, channel):
     return False
 
 
-async def run_batches(key, channel, q, batch, inbox, status):
-    """Run one turn, then single follow-up turns for coalesced arrivals."""
+async def run_batches(key, channel, q, batch, inbox, status,
+                      reply_author_id=None):
+    """Run one turn, then single follow-up turns for coalesced arrivals.
+
+    reply_author_id: override for the reply's recorded author. The 🔁
+    regen path passes the *original* prompt author here — the batch's
+    message is the bot's own reply, which must not become the author."""
     global ACTIVE_TURNS
     async with ACTIVE_GUARD:
         ACTIVE_TURNS += 1
@@ -2398,7 +2480,8 @@ async def run_batches(key, channel, q, batch, inbox, status):
                 save_state()
                 log.info("[%s] session: %s", key, new_sid)
             REGEN_PROMPTS[key] = "\n\n---\n\n".join(p for _, p, _ in batch)
-            await deliver_reply(key, channel, msgs, reply, inbox, status)
+            await deliver_reply(key, channel, msgs, reply, inbox, status,
+                                reply_author_id=reply_author_id)
             REGEN_PROMPTS.pop(key, None)
             status = None
             async with q.guard:
@@ -3244,7 +3327,10 @@ async def _regen_reply(reaction, info):
     PROMPT_MSGS[message.id] = {"key": key, "author_id": info["author_id"]}
     if len(PROMPT_MSGS) > 500:
         PROMPT_MSGS.pop(next(iter(PROMPT_MSGS)), None)
-    await run_batches(key, channel, q, [(message, prompt, [])], inbox, None)
+    # Carry the original prompt author through: the batch's message is the
+    # bot's own reply, which must not become the recorded reply author.
+    await run_batches(key, channel, q, [(message, prompt, [])], inbox, None,
+                      reply_author_id=info["author_id"])
 
 
 @client.event
