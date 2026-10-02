@@ -5,7 +5,8 @@ Two-way chat between Discord and opencode. DM the bot, it forwards to `opencode 
 - DMs: any message goes to opencode (per-user session)
 - Servers: `@bot` mention or `!oc <prompt>` (per-channel session)
 - `!new`: start a fresh opencode session (plain message with `!`, **not** `/new` — there are no slash commands)
-- `!status`: session id, model, turns, tokens, cost, inbox, queue state
+- `!status`: session id, model, voice/VC state, turns, tokens, cost, inbox, queue state
+- `!voice [on|off]`: spoken replies via Voicebox (Computer voice); `!join` / `!leave`: speak replies in your voice channel (servers)
 - `!model`: show current + available; `!model provider/name` to switch, `!model clear` to reset
 - `/sessions`: dropdown browser to switch opencode sessions (servers; DMs after global sync)
 - `/model`: autocomplete to switch the model for this chat
@@ -15,6 +16,7 @@ Two-way chat between Discord and opencode. DM the bot, it forwards to `opencode 
 - Per-session coalescing queue (a message arriving mid-turn merges into one follow-up, not its own run)
 - Fence-aware chunking (`chunking.py`, shared with the sender) + long replies sent as `reply.md`
 - Attachments in both directions (direct drop/send bypass the model)
+- Voice loop via Voicebox: record a voice note and the transcript goes to opencode; replies come back spoken (voice channel when `!join`ed, else `reply.wav`)
 - `discord-send.py`: one-shot sender for shell/opencode (REST only, no gateway)
 
 ## Setup
@@ -63,6 +65,21 @@ Two-way chat between Discord and opencode. DM the bot, it forwards to `opencode 
 | `LOG_LEVEL` | `INFO` | `DEBUG` dumps full opencode stdout/stderr |
 | `REPLY_AS_FILE_LIMIT` | `4000` | Replies longer than this go out as `reply.md`; `0` disables |
 | `REACT_START` / `REACT_DONE` / `REACT_ERROR` | hourglass / check / cross | Working/done/error reactions; empty disables |
+| `VOICEBOX_URL` | `http://127.0.0.1:17493` | Voicebox base URL; empty disables all voice features |
+| `VOICEBOX_PROFILE` | `Computer` | Voice profile name or id for spoken replies |
+| `VOICEBOX_VOICE` | `1` | `1` = attach a spoken reply to every turn; `0` = text-only unless a chat opts in with `!voice on` |
+| `VOICEBOX_TIMEOUT` | `120` | Seconds per TTS/STT request |
+| `VOICEBOX_MAX_CHARS` | `1200` | Max chars sent to TTS per turn (full text still posts) |
+| `VOICEBOX_TRANSCRIBE` | `1` | `1` = transcribe inbound voice notes/audio via Voicebox Whisper; `0` = pass raw audio with `--file` |
+| `VOICEBOX_STT_MODEL` | empty (= server default) | Whisper size: `base`/`small`/`medium`/`large`/`turbo` |
+| `VOICEBOX_LANGUAGE` | empty (= auto) | STT language hint, e.g. `en` |
+| `FFMPEG_BIN` | `ffmpeg` | ffmpeg executable for voice-channel playback |
+| `OPUS_LIB` | empty (= auto-detect) | Explicit path to the Opus DLL; otherwise `libopus-0.x64.dll` / `opus.dll` next to `bot.py`, then system `opus` |
+| `SAY_DIR` | `say_queue` | Dir watched for `*.txt` drop-ins the bot speaks in VC (empty disables); see Voice |
+| `SAY_POLL` | `2.0` | Seconds between say-queue scans |
+| `SAY_MAX_BYTES` | `8192` | Largest say file accepted (bigger is skipped) |
+| `VC_AUTOJOIN` | empty (= disabled) | Voice channel id to join on startup and sit in until restart |
+| `VC_AUTOREJOIN` | `1` | `1` = rejoin the autojoin channel if disconnected unexpectedly (`!leave` still sticks) |
 
 `sample.env` shows the same knobs.
 
@@ -80,11 +97,31 @@ Two-way chat between Discord and opencode. DM the bot, it forwards to `opencode 
 
 **Direct send (no model involved):** `send me D:\files\clip.mp4` (or `send <path>`) with no attachments uploads that path straight via `discord.File`. If the text isn't an existing file path, it falls through to opencode as normal chat.
 
-**Via opencode:** files save to `attachments/<dm_or_channel>/` and the local path is added to the prompt. Text/code/images (incl. gif) are also passed with `opencode run --file`. True video (`mp4/mov/mkv/avi/webm/m4v/mpg/mpeg/wmv/flv`, any `video/*`) is **path-only** — never inlined, the model uses shell/file tools on the saved path.
+**Via opencode:** files save to `attachments/<dm_or_channel>/` and the local path is added to the prompt. Text/code/images (incl. gif) are also passed with `opencode run --file`. True video (`mp4/mov/mkv/avi/webm/m4v/mpg/mpeg/wmv/flv`, any `video/*`) is **path-only** — never inlined, the model uses shell/file tools on the saved path. Audio notes (`ogg/opus/mp3/wav/m4a/flac/aac/webm`, any `audio/*`) are **transcribed** via Voicebox first — opencode sees `[Voice message NAME (Ns): transcript]`, never the raw bytes (falls back to `--file` if transcription fails).
 
 **Outbound via opencode:** the model emits `[[attach:D:\files\clip.mp4]]` on its own line; the bot strips the marker and uploads. Markers pointing at nonexistent files are silently skipped (quoted doc examples must never spam the channel); oversize files come back as text errors. The model can also react to your message with `[[react:EMOJI]]` (literal emoji, or custom `<:name:id>`; max 5 per turn, invalid ones are skipped with a console warning).
 
 Model-driven moves/writes require `OPENCODE_AUTO=1` (or an agent that can approve file tools).
+
+## Voice
+
+Full async voice loop backed by Voicebox (`VOICEBOX_URL`, on by default — no `PyNaCl`/`davey`/Opus needed for any of this):
+
+- **You → bot:** record a Discord voice note (or attach audio). The bot transcribes it via Voicebox Whisper and opencode sees `[Voice message voice-message.ogg (12.4s): ...]`. Send a note alone or with text. If transcription fails, the raw file falls back to `--file`.
+- **Bot → you:** every reply is also spoken in `VOICEBOX_PROFILE` (default `Computer`). Long replies are truncated to `VOICEBOX_MAX_CHARS` for speech; full text always posts. Code fences, `[[attach:]]`/`[[react:]]` markers, and markdown links are stripped before speaking.
+
+Spoken delivery, in order of preference:
+
+1. **Voice channel (servers):** sit in a VC and send `!join` (`!oc !join` / `@bot !join`). Replies play live, queued serially — no file to click. `!leave` disconnects. DMs have no VC, so they always use files.
+2. **`reply.wav` file:** when not joined (or in DMs), the spoken reply attaches to the channel.
+
+Per-chat control: `!voice off` mutes spoken replies entirely (VC or file), `!voice on` re-enables; `!voice` shows state. TTS failure never blocks the text reply.
+
+**Staying in VC:** set `VC_AUTOJOIN` to a voice channel id and the bot joins it on startup and sits there until restart (`VC_AUTOREJOIN=1` rejoins after unexpected drops; `!leave` is still respected and sticks). Find the id by right-clicking the channel → Copy Channel ID (Developer Mode on).
+
+**Say-queue (agent-initiated speech):** the bot watches `SAY_DIR` (default `say_queue/`) every `SAY_POLL` seconds. Drop in a `.txt` file and it speaks it in VC via the same Computer voice — no Discord message needed, no opencode call. Plain `*.txt` plays in every connected VC; `<guildid>_*.txt` targets one server. Files are deleted after speaking; if no VC is connected they're held until one is (TTS failures retry with backoff). This is the path for speaking *from* a shell/agent session: anything that can write a file (including opencode itself mid-turn, or another harness) can make the bot talk. `!say <text>` is the same thing from Discord chat. `!status` shows pending say files.
+
+Prerequisites: Voicebox running with a `Computer` (or your) profile and a Whisper model downloaded (first `/transcribe` may return 202 while it downloads — the bot treats that as "transcription unavailable" and falls back to `--file`). VC playback additionally needs `ffmpeg` on PATH and Opus (`pip install -r requirements.txt` covers `PyNaCl`/`davey`; the Windows Opus DLL is auto-loaded from next to `bot.py`, override with `OPUS_LIB`). There is no live VC *listening* — `discord.py` can't receive audio; voice notes are the input path.
 
 ## Slash commands
 
@@ -118,3 +155,6 @@ With `DEFAULT_DISCORD_CHANNEL` set in `.env`, omit `--to`. Targets: `#name`, `<c
 - **Raw tool output in chat**: tool results (`part.type: tool`) are filtered out; only assistant text is forwarded. If dumps leak through on a new event shape, grab the `opencode event types: [...]` DEBUG line and it can be added to the filter.
 - **Operational chatter**: agent/session notices ("Switched agent to Build") are filtered from chat. If a future opencode schema produces zero known chat events, the bot falls back to a greedy extract and logs a warning — noise over silence, and the warning says so.
 - **No reply at all**: check stderr logs (`[dm:...]` / `[guild:...]` lines), verify Message Content intent is on, and that your user id is in `ALLOWED_USER_IDS` (anyone else is silently ignored).
+- **Voice note came back as a file reference, not a transcript**: Voicebox was unreachable, still downloading the Whisper model (first run), or Whisper returned empty twice. The bot falls back to `--file` so nothing is lost — check the bot log for `voicebox STT` lines and retry.
+- **No spoken reply**: `!voice off` mutes TTS per chat (`!status` shows it); empty `VOICEBOX_URL` disables voice globally; TTS failure only ever drops the audio, text always posts.
+- **`!join` says Opus isn't loaded**: the bot needs `libopus-0.x64.dll` next to `bot.py` (or set `OPUS_LIB`), plus `ffmpeg` on PATH. The startup log says which opus path it loaded.

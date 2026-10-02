@@ -35,12 +35,41 @@ Config via env (or .env in cwd / ~/.config/opencode-discord/):
     LOG_LEVEL           default INFO (e.g. DEBUG for verbose)
     REPLY_AS_FILE_LIMIT default 4000 (longer replies sent as reply.md; 0 disables)
     REACT_START/DONE/ERROR  default hourglass/check/cross (empty disables)
+    VOICEBOX_URL        default http://127.0.0.1:17493 (Voicebox TTS; empty disables voice)
+    VOICEBOX_PROFILE    default "Computer" (voice profile name or id)
+    VOICEBOX_VOICE      "1" = attach a spoken reply to every turn (default "1");
+                        "0" = text-only unless a chat opts in with `!voice on`
+    VOICEBOX_TIMEOUT    seconds per TTS request (default 120)
+    VOICEBOX_MAX_CHARS  max chars sent to TTS per turn (default 1200, rest stays text-only)
+    VOICEBOX_TRANSCRIBE "1" = transcribe inbound voice notes/audio via Voicebox
+                        Whisper before opencode sees them (default "1"); "0" keeps
+                        the old behavior (raw audio passed with --file)
+    VOICEBOX_STT_MODEL  optional Whisper size (base/small/medium/large/turbo);
+                        empty = server default
+    VOICEBOX_LANGUAGE   optional STT language hint (e.g. "en"); empty = auto
+    FFMPEG_BIN          ffmpeg executable for voice-channel playback (default "ffmpeg")
+    OPUS_LIB            optional explicit path to the Opus DLL (default: looks for
+                        libopus-0.x64.dll / opus.dll next to bot.py, then system "opus")
+    SAY_DIR             dir watched for *.txt drop-ins the bot speaks in VC (default
+                        "say_queue"). "<guildid>_*.txt" targets one server, plain
+                        "*.txt" plays in every connected VC. Empty disables.
+    SAY_POLL            seconds between say-queue scans (default 2.0)
+    SAY_MAX_BYTES       largest say file accepted (default 8192; bigger is skipped)
+    VC_AUTOJOIN         voice channel id to join on startup (empty disables)
+    VC_AUTOREJOIN       "1" = rejoin the autojoin channel if disconnected
+                        unexpectedly (default "1"; `!leave` still sticks)
+
+    Voice channels (guilds only, text stays the input):
+    `!join` pulls the bot into your current voice channel; every voice-enabled
+    reply is then spoken there automatically instead of attaching reply.wav.
+    `!leave` disconnects. DMs have no voice channel, so reply.wav attaches as before.
 
 Required Discord privileged intent: Message Content (toggle in the
 Developer Portal -> Bot -> Privileged Gateway Intents).
 """
 
 import asyncio
+import io
 import json
 import logging
 import os
@@ -50,6 +79,8 @@ import subprocess
 import sys
 import tempfile
 import time
+import urllib.error
+import urllib.request
 from datetime import datetime
 from pathlib import Path
 
@@ -125,6 +156,22 @@ REPLY_AS_FILE_LIMIT = _env_int("REPLY_AS_FILE_LIMIT", 4000)
 REACT_START = os.environ.get("REACT_START", "\u23f3")
 REACT_DONE = os.environ.get("REACT_DONE", "\u2705")
 REACT_ERROR = os.environ.get("REACT_ERROR", "\u274c")
+VOICEBOX_URL = os.environ.get("VOICEBOX_URL", "http://127.0.0.1:17493").strip().rstrip("/")
+VOICEBOX_PROFILE = os.environ.get("VOICEBOX_PROFILE", "Computer").strip()
+VOICEBOX_VOICE = os.environ.get("VOICEBOX_VOICE", "1") == "1"
+VOICEBOX_TIMEOUT = _env_int("VOICEBOX_TIMEOUT", 120)
+VOICEBOX_MAX_CHARS = _env_int("VOICEBOX_MAX_CHARS", 1200)
+VOICEBOX_TRANSCRIBE = os.environ.get("VOICEBOX_TRANSCRIBE", "1") == "1"
+VOICEBOX_STT_MODEL = os.environ.get("VOICEBOX_STT_MODEL", "").strip()
+VOICEBOX_LANGUAGE = os.environ.get("VOICEBOX_LANGUAGE", "").strip()
+FFMPEG_BIN = os.environ.get("FFMPEG_BIN", "ffmpeg").strip() or "ffmpeg"
+OPUS_LIB = os.environ.get("OPUS_LIB", "").strip()
+SAY_DIR = Path(os.environ.get("SAY_DIR", "say_queue").strip() or ".bot-voice-disabled")
+SAY_DIR_ENABLED = os.environ.get("SAY_DIR", "say_queue").strip() != ""
+SAY_POLL = _env_float("SAY_POLL", 2.0) or 2.0
+SAY_MAX_BYTES = _env_int("SAY_MAX_BYTES", 8192)
+VC_AUTOJOIN = os.environ.get("VC_AUTOJOIN", "").strip()
+VC_AUTOREJOIN = os.environ.get("VC_AUTOREJOIN", "1") == "1"
 
 logging.basicConfig(
     level=getattr(logging, LOG_LEVEL, logging.INFO),
@@ -194,6 +241,9 @@ BRIDGE_NOTE = (
     "Text/code/images (incl. gif) the user attaches are passed with --file "
     "AND saved locally; video files (mp4/mov/etc) are NOT inlined - they "
     "are only saved locally, use shell/file tools on the saved path. "
+    "Voice/audio notes the user records are transcribed before you see them - "
+    "the transcript appears as [Voice message NAME (Ns): text]; treat it as "
+    "what the user said. "
     "To send a file back to the user, put [[attach:FULL_PATH]] on its own "
     "line, e.g. [[attach:D:\\files\\clip.mp4]]. Use absolute paths.]"
 )
@@ -208,29 +258,32 @@ if not ALLOWED:
 
 
 def load_state():
-    """State shape: {"active": {...}, "known": {...}, "models": {...}}."""
+    """State shape: {"active": {...}, "known": {...}, "models": {...}, "voice": {...}}."""
     try:
         raw = json.loads(STATE_FILE.read_text())
     except (OSError, json.JSONDecodeError):
-        return {"active": {}, "known": {}, "models": {}}
+        return {"active": {}, "known": {}, "models": {}, "voice": {}}
     if isinstance(raw, dict) and isinstance(raw.get("active"), dict):
         known = raw.get("known")
         models = raw.get("models")
+        voice = raw.get("voice")
         return {"active": raw["active"],
                 "known": known if isinstance(known, dict) else {},
-                "models": models if isinstance(models, dict) else {}}
+                "models": models if isinstance(models, dict) else {},
+                "voice": voice if isinstance(voice, dict) else {}}
     # legacy flat {key: sid}
     act = ({k: v for k, v in raw.items() if isinstance(v, str)}
            if isinstance(raw, dict) else {})
     return {"active": act,
             "known": {k: [v] for k, v in act.items()},
-            "models": {}}
+            "models": {}, "voice": {}}
 
 
 def save_state():
     STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
     STATE_FILE.write_text(json.dumps(
-        {"active": SESSIONS, "known": KNOWN, "models": MODEL_OVERRIDES},
+        {"active": SESSIONS, "known": KNOWN, "models": MODEL_OVERRIDES,
+         "voice": VOICE_OVERRIDES},
         indent=2))
 
 
@@ -238,6 +291,7 @@ _STATE = load_state()
 SESSIONS = _STATE["active"]  # key -> opencode session id
 KNOWN = _STATE["known"]  # key -> [opencode session ids the bot has used]
 MODEL_OVERRIDES = _STATE["models"]  # key -> "provider/model"
+VOICE_OVERRIDES = _STATE["voice"]  # key -> bool (True = voice on)
 
 
 def remember_session(key, sid):
@@ -579,6 +633,454 @@ def resolve_outbound(path_str):
     return p
 
 
+def voice_enabled(key):
+    """Per-chat override wins, else the VOICEBOX_VOICE global default."""
+    if key in VOICE_OVERRIDES:
+        return bool(VOICE_OVERRIDES[key])
+    return VOICEBOX_VOICE
+
+
+def clean_for_tts(reply):
+    """Strip markers/markdown the listener should never hear. Truncated."""
+    text, _ = split_attach_markers(reply)
+    text, _ = split_react_markers(text)
+    # fenced code blocks -> keep the inner text, drop the fence language tag
+    text = re.sub(r"```\w*\n?", " ", text)
+    text = text.replace("```", " ")
+    text = re.sub(r"`([^`]*)`", r"\1", text)
+    # markdown links/images -> keep the label
+    text = re.sub(r"!\[([^\]]*)\]\([^)]*\)", r"\1", text)
+    text = re.sub(r"\[([^\]]*)\]\([^)]*\)", r"\1", text)
+    text = re.sub(r"\s+", " ", text).strip()
+    if VOICEBOX_MAX_CHARS > 0 and len(text) > VOICEBOX_MAX_CHARS:
+        cut = text[:VOICEBOX_MAX_CHARS]
+        # prefer a sentence boundary so speech doesn't stop mid-word
+        for sep in (". ", "! ", "? ", "; ", ", ", " "):
+            i = cut.rfind(sep)
+            if i > VOICEBOX_MAX_CHARS // 2:
+                cut = cut[:i + 1]
+                break
+        text = cut.strip()
+    return text
+
+
+_VOICE_PROFILE_CACHE = {"at": 0.0, "id": None, "name": ""}
+_VOICE_PROFILE_TTL = 3600
+
+
+def get_voicebox_profile_id():
+    """Resolve VOICEBOX_PROFILE (name or id) to a profile id. None on failure."""
+    if not VOICEBOX_URL or not VOICEBOX_PROFILE:
+        return None
+    now = time.monotonic()
+    if (_VOICE_PROFILE_CACHE["id"]
+            and _VOICE_PROFILE_CACHE["name"] == VOICEBOX_PROFILE
+            and now - _VOICE_PROFILE_CACHE["at"] < _VOICE_PROFILE_TTL):
+        return _VOICE_PROFILE_CACHE["id"]
+    try:
+        req = urllib.request.Request(
+            f"{VOICEBOX_URL}/profiles",
+            headers={"X-Voicebox-Client-Id": "discord-bot"})
+        with urllib.request.urlopen(req, timeout=15) as r:
+            items = json.loads(r.read().decode("utf-8", "replace"))
+    except Exception as e:
+        log.warning("voicebox profiles failed: %s", e)
+        return None
+    if not isinstance(items, list):
+        return None
+    want = VOICEBOX_PROFILE.lower()
+    for e in items:
+        if not isinstance(e, dict):
+            continue
+        if str(e.get("id", "")) == VOICEBOX_PROFILE:
+            _VOICE_PROFILE_CACHE.update(
+                at=now, id=e["id"], name=VOICEBOX_PROFILE)
+            return e["id"]
+    for e in items:
+        if not isinstance(e, dict):
+            continue
+        if str(e.get("name", "")).lower() == want:
+            _VOICE_PROFILE_CACHE.update(
+                at=now, id=e.get("id"), name=VOICEBOX_PROFILE)
+            log.info("voicebox profile %r -> %s", e.get("name"), e.get("id"))
+            return e.get("id")
+    log.warning("voicebox profile %r not found (%d profiles)",
+                VOICEBOX_PROFILE, len(items))
+    return None
+
+
+def tts_wav(reply_text):
+    """Blocking Voicebox TTS. Returns wav bytes or None (never raises)."""
+    if not VOICEBOX_URL:
+        return None
+    text = clean_for_tts(reply_text or "")
+    if not text:
+        return None
+    pid = get_voicebox_profile_id()
+    if not pid:
+        return None
+    payload = json.dumps(
+        {"profile_id": pid, "text": text, "language": "en"}).encode()
+    try:
+        req = urllib.request.Request(
+            f"{VOICEBOX_URL}/generate/stream", data=payload,
+            headers={"Content-Type": "application/json",
+                     "X-Voicebox-Client-Id": "discord-bot"})
+        with urllib.request.urlopen(req, timeout=VOICEBOX_TIMEOUT) as r:
+            body = r.read()
+    except urllib.error.HTTPError as e:
+        try:
+            detail = e.read().decode("utf-8", "replace")[:500]
+        except Exception:
+            detail = ""
+        log.warning("voicebox TTS http %s: %s", e.code, detail)
+        return None
+    except Exception as e:
+        log.warning("voicebox TTS failed: %s", e)
+        return None
+    if len(body) < 1000:
+        log.warning("voicebox TTS returned %d bytes (not audio?)", len(body))
+        return None
+    log.info("voicebox TTS: %d chars -> %d bytes", len(text), len(body))
+    return body
+
+
+# Audio the bot transcribes via Voicebox instead of passing raw to opencode.
+# Matches Voicebox's own accepted upload exts; Discord voice messages are .ogg.
+STT_AUDIO_EXTS = {
+    ".wav", ".mp3", ".m4a", ".ogg", ".oga", ".opus",
+    ".flac", ".aac", ".webm",
+}
+
+
+def is_audio_attachment(filename, content_type):
+    if Path(filename).suffix.lower() in STT_AUDIO_EXTS:
+        return True
+    return (content_type or "").split(";")[0].strip().lower().startswith(
+        "audio/")
+
+
+def transcribe_audio_file(path):
+    """Blocking Voicebox STT. Returns (text, duration) or (None, None)."""
+    if not VOICEBOX_URL:
+        return None, None
+    import mimetypes
+    import uuid
+    filename = Path(path).name
+    ctype = mimetypes.guess_type(filename)[0] or "application/octet-stream"
+    try:
+        data = Path(path).read_bytes()
+    except OSError as e:
+        log.warning("STT read failed (%s): %s", path, e)
+        return None, None
+    boundary = uuid.uuid4().hex
+    body = io.BytesIO()
+    fields = {}
+    if VOICEBOX_LANGUAGE:
+        fields["language"] = VOICEBOX_LANGUAGE
+    if VOICEBOX_STT_MODEL:
+        fields["model"] = VOICEBOX_STT_MODEL
+    for k, v in fields.items():
+        body.write(
+            f"--{boundary}\r\nContent-Disposition: form-data; "
+            f"name=\"{k}\"\r\n\r\n{v}\r\n".encode())
+    body.write(
+        f"--{boundary}\r\nContent-Disposition: form-data; name=\"file\"; "
+        f"filename=\"{filename}\"\r\nContent-Type: {ctype}\r\n\r\n".encode())
+    body.write(data)
+    body.write(f"\r\n--{boundary}--\r\n".encode())
+    for attempt in (1, 2):
+        try:
+            req = urllib.request.Request(
+                f"{VOICEBOX_URL}/transcribe", data=body.getvalue(),
+                headers={"Content-Type":
+                         f"multipart/form-data; boundary={boundary}",
+                         "X-Voicebox-Client-Id": "discord-bot"})
+            with urllib.request.urlopen(req, timeout=VOICEBOX_TIMEOUT) as r:
+                obj = json.loads(r.read().decode("utf-8", "replace"))
+        except urllib.error.HTTPError as e:
+            try:
+                detail = e.read().decode("utf-8", "replace")[:300]
+            except Exception:
+                detail = ""
+            log.warning("voicebox STT http %s: %s", e.code, detail)
+            return None, None
+        except Exception as e:
+            log.warning("voicebox STT failed: %s", e)
+            return None, None
+        text = (obj.get("text") or "").strip() if isinstance(obj, dict) else ""
+        if text or attempt == 2:
+            break
+        log.warning("voicebox STT empty for %s, retrying once", filename)
+    try:
+        duration = float(obj.get("duration") or 0)
+    except (ValueError, TypeError, AttributeError):
+        duration = 0
+    if not text:
+        log.warning("voicebox STT returned no text for %s", filename)
+        return None, None
+    log.info("voicebox STT: %s (%.1fs) -> %d chars",
+             filename, duration, len(text))
+    return text, duration
+
+
+def ensure_opus():
+    """Load the Opus codec needed for voice-channel audio. True when ready."""
+    if discord.opus.is_loaded():
+        return True
+    here = Path(__file__).resolve().parent
+    candidates = ([OPUS_LIB] if OPUS_LIB else []) + [
+        str(here / "libopus-0.x64.dll"),
+        str(here / "opus.dll"),
+        "opus",
+        "libopus-0",
+    ]
+    for c in candidates:
+        try:
+            discord.opus.load_opus(c)
+        except Exception as e:
+            log.debug("opus load via %r failed: %s", c, e)
+            continue
+        if discord.opus.is_loaded():
+            log.info("opus loaded via %r", c)
+            return True
+    log.warning("opus not loaded - !join will fail until an Opus DLL is "
+                "available (OPUS_LIB or libopus-0.x64.dll next to bot.py)")
+    return False
+
+
+VC_QUEUES = {}  # guild_id -> asyncio.Queue[bytes]
+VC_PLAYERS = {}  # guild_id -> asyncio.Task
+
+
+def guild_voice_client(guild_id):
+    g = client.get_guild(guild_id)
+    return g.voice_client if g else None
+
+
+async def vc_player(guild_id):
+    """Serial playback loop: one wav file at a time through the guild's VC."""
+    q = VC_QUEUES[guild_id]
+    while True:
+        tmppath = await q.get()
+        try:
+            vc = guild_voice_client(guild_id)
+            if vc is None or not vc.is_connected():
+                log.info("[guild:%s] VC gone, dropping queued clip", guild_id)
+                try:
+                    os.unlink(tmppath)
+                except OSError:
+                    pass
+                continue
+            done = asyncio.Event()
+
+            def _after(err, path=tmppath, gid=guild_id):
+                if err:
+                    log.warning("[guild:%s] VC play error: %s", gid, err)
+                try:
+                    os.unlink(path)
+                except OSError:
+                    pass
+                client.loop.call_soon_threadsafe(done.set)
+
+            try:
+                src = discord.FFmpegPCMAudio(tmppath, executable=FFMPEG_BIN)
+            except Exception:
+                log.exception("[guild:%s] ffmpeg source failed", guild_id)
+                try:
+                    os.unlink(tmppath)
+                except OSError:
+                    pass
+                continue
+            log.info("[guild:%s] speaking %s (%d queued)",
+                     guild_id, tmppath, q.qsize())
+            vc.play(src, after=_after)
+            await done.wait()
+        finally:
+            q.task_done()
+
+
+async def vc_say(guild_id, wav, inbox):
+    """Queue wav bytes for VC playback. Returns False when not connected."""
+    vc = guild_voice_client(guild_id)
+    if vc is None or not vc.is_connected():
+        return False
+    try:
+        fd, tmppath = tempfile.mkstemp(
+            prefix="vc-", suffix=".wav", dir=str(inbox))
+        with os.fdopen(fd, "wb") as f:
+            f.write(wav)
+    except Exception:
+        log.exception("[guild:%s] VC temp write failed", guild_id)
+        return False
+    q = VC_QUEUES.get(guild_id)
+    if q is None:
+        q = asyncio.Queue()
+        VC_QUEUES[guild_id] = q
+        VC_PLAYERS[guild_id] = asyncio.ensure_future(vc_player(guild_id))
+    q.put_nowait(tmppath)
+    return True
+
+
+def vc_drop(guild_id):
+    """Empty a guild's playback queue, deleting unplayed clips."""
+    q = VC_QUEUES.get(guild_id)
+    if q is None:
+        return
+    n = 0
+    while not q.empty():
+        try:
+            tmppath = q.get_nowait()
+        except asyncio.QueueEmpty:
+            break
+        try:
+            os.unlink(tmppath)
+        except OSError:
+            pass
+        q.task_done()
+        n += 1
+    if n:
+        log.info("[guild:%s] dropped %d queued VC clip(s)", guild_id, n)
+
+
+VC_TMP = ATTACH_DIR / "_vc"  # staging for say-queue + VC playout clips
+VC_EXPECTED_BYE = set()  # guild ids whose disconnect was a `!leave`
+SAY_STARTED = False
+SAY_FAIL_AT = {}  # path -> last failed attempt (monotonic)
+
+
+def say_targets(path):
+    """Parse "<guildid>_name.txt" -> [guildid]; plain "*.txt" -> [] (= all)."""
+    m = re.match(r"^(\d+)_", Path(path).name)
+    return [int(m.group(1))] if m else []
+
+
+def connected_guild_ids():
+    return [g.id for g in client.guilds
+            if g.voice_client is not None
+            and g.voice_client.is_connected()]
+
+
+async def process_say_file(path):
+    """TTS one drop-in and queue it for VC. Returns True when consumed."""
+    try:
+        if path.stat().st_size > SAY_MAX_BYTES:
+            log.warning("say-queue skipping oversize %s (%d bytes)",
+                        path.name, path.stat().st_size)
+            return True  # consume: never speakable
+        text = path.read_text(encoding="utf-8", errors="replace").strip()
+    except OSError as e:
+        log.warning("say-queue read failed (%s): %s", path.name, e)
+        return True
+    if not text:
+        return True  # consume empty files silently
+    targets = [g for g in (say_targets(path) or connected_guild_ids())]
+    live = [g for g in targets if guild_voice_client(g) is not None
+            and guild_voice_client(g).is_connected()]
+    if not live:
+        return False  # hold for later; nobody to speak to yet
+    wav = await asyncio.to_thread(tts_wav, text)
+    if not wav:
+        last = SAY_FAIL_AT.get(str(path), 0.0)
+        now = time.monotonic()
+        if now - last < 60:
+            return False  # backing off, keep file
+        SAY_FAIL_AT[str(path)] = now
+        log.warning("say-queue TTS failed, will retry: %s", path.name)
+        return False
+    VC_TMP.mkdir(parents=True, exist_ok=True)
+    ok = False
+    for gid in live:
+        if await vc_say(gid, wav, VC_TMP):
+            ok = True
+            log.info("[guild:%s] say-queue: %s (%d chars)",
+                     gid, path.name, len(text))
+    return ok
+
+
+async def say_watcher():
+    """Background loop: speak *.txt drop-ins from SAY_DIR, then delete."""
+    while True:
+        try:
+            await asyncio.sleep(SAY_POLL)
+            if not SAY_DIR.is_dir():
+                continue
+            files = sorted(
+                (p for p in SAY_DIR.iterdir()
+                 if p.is_file() and p.suffix.lower() == ".txt"
+                 and not p.name.startswith(".")),
+                key=lambda p: p.stat().st_mtime)
+            for p in files[:20]:
+                try:
+                    if await process_say_file(p):
+                        try:
+                            p.unlink()
+                        except OSError:
+                            pass
+                        SAY_FAIL_AT.pop(str(p), None)
+                except Exception:
+                    log.exception("say-queue failed on %s", p.name)
+        except asyncio.CancelledError:
+            return
+        except Exception:
+            log.exception("say-watcher loop failed")
+
+
+async def autojoin_vc():
+    """Join VC_AUTOJOIN once at startup. Best-effort."""
+    if not VC_AUTOJOIN:
+        return
+    try:
+        cid = int(VC_AUTOJOIN)
+    except ValueError:
+        log.warning("VC_AUTOJOIN invalid (%r) - skipping", VC_AUTOJOIN)
+        return
+    ch = client.get_channel(cid)
+    if ch is None:
+        try:
+            ch = await client.fetch_channel(cid)
+        except Exception as e:
+            log.warning("VC_AUTOJOIN channel %s unreachable: %s", cid, e)
+            return
+    if not hasattr(ch, "connect"):
+        log.warning("VC_AUTOJOIN %s is not a voice channel", cid)
+        return
+    if not ensure_opus():
+        log.warning("VC_AUTOJOIN skipped - opus not loaded")
+        return
+    try:
+        vc = getattr(ch.guild, "voice_client", None)
+        if vc is not None and vc.is_connected():
+            if vc.channel is not None and vc.channel.id == ch.id:
+                log.info("VC_AUTOJOIN already in %s", ch.name)
+                return
+            await vc.move_to(ch)
+        else:
+            await ch.connect()
+        log.info("VC_AUTOJOIN joined %s", ch.name)
+    except Exception as e:
+        log.warning("VC_AUTOJOIN join failed: %s", e)
+
+
+async def autorejoin_vc(guild_id, delay=10):
+    """Rejoin the autojoin channel after an unexpected disconnect."""
+    await asyncio.sleep(delay)
+    if not VC_AUTOJOIN or not VC_AUTOREJOIN:
+        return
+    if guild_voice_client(guild_id) is not None:
+        return  # already back somehow
+    try:
+        if int(VC_AUTOJOIN or 0):
+            ch = client.get_channel(int(VC_AUTOJOIN))
+            if ch is not None and getattr(ch, "guild", None) is not None \
+                    and ch.guild.id != guild_id:
+                return  # autojoin belongs to another server
+    except ValueError:
+        return
+    log.info("[guild:%s] autorejoin in progress", guild_id)
+    await autojoin_vc()
+
+
 intents = discord.Intents.default()
 intents.message_content = True
 intents.dm_messages = True
@@ -653,7 +1155,9 @@ async def deliver_reply(key, channel, messages, reply, inbox, status):
         except Exception:
             pass
 
-    # long replies go out as a .md file instead of a wall of chunks
+    # long replies go out as a .md file instead of a wall of chunks.
+    # Voice reads the full text (up to VOICEBOX_MAX_CHARS), not the placeholder.
+    voice_text = reply
     reply_file = None
     if REPLY_AS_FILE_LIMIT > 0 and len(reply) > REPLY_AS_FILE_LIMIT:
         try:
@@ -699,6 +1203,30 @@ async def deliver_reply(key, channel, messages, reply, inbox, status):
             except Exception as e:
                 log.exception("[%s] upload failed: %s", key, p)
                 await channel.send(f"(failed to attach {p.name}: {e})")
+        # --- voice reply: spoken version of the same text via Voicebox ---
+        # Text is always delivered above; TTS failure never blocks it.
+        # Guild VC connected -> spoken in the channel (no file to click).
+        # Otherwise (DMs, not joined) -> reply.wav attaches as before.
+        if voice_enabled(key) and voice_text.strip():
+            try:
+                async with channel.typing():
+                    wav = await asyncio.to_thread(tts_wav, voice_text)
+                if wav:
+                    if len(wav) > MAX_ATTACH_MB * 1024 * 1024:
+                        log.warning("[%s] voice reply too big: %d bytes",
+                                    key, len(wav))
+                        wav = None
+                if wav:
+                    guild = getattr(channel, "guild", None)
+                    played = (await vc_say(guild.id, wav, inbox)
+                              if guild is not None else False)
+                    if not played:
+                        log.info("[%s] uploading voice reply (%d bytes)",
+                                 key, len(wav))
+                        await channel.send(file=discord.File(
+                            io.BytesIO(wav), filename="reply.wav"))
+            except Exception:
+                log.exception("[%s] voice reply send failed", key)
     except Exception:
         log.exception("[%s] reply send failed", key)
         for m in messages:
@@ -1004,7 +1532,13 @@ async def sessions_cmd(interaction: discord.Interaction):
 async def on_ready():
     log.info("logged in as %s (id %s)", client.user, client.user.id)
     await update_presence()
-    global TREE_SYNCED
+    global TREE_SYNCED, SAY_STARTED
+    if not SAY_STARTED and SAY_DIR_ENABLED:
+        SAY_STARTED = True
+        SAY_DIR.mkdir(parents=True, exist_ok=True)
+        asyncio.ensure_future(say_watcher())
+        log.info("say-queue watching %s", SAY_DIR)
+    await autojoin_vc()
     if not TREE_SYNCED:
         TREE_SYNCED = True
         for g in client.guilds:
@@ -1019,6 +1553,20 @@ async def on_ready():
             log.info("slash synced globally (DMs can take up to an hour)")
         except Exception as e:
             log.warning("global sync failed: %s", e)
+
+
+@client.event
+async def on_voice_state_update(member, before, after):
+    # Bot was disconnected / moved out: drop queued clips for that guild.
+    if member.id == client.user.id and after.channel is None:
+        guild = getattr(before.channel, "guild", None)
+        if guild is not None:
+            vc_drop(guild.id)
+            log.info("[guild:%s] VC disconnected, queue cleared", guild.id)
+            if guild.id in VC_EXPECTED_BYE:
+                VC_EXPECTED_BYE.discard(guild.id)
+            elif VC_AUTOREJOIN and VC_AUTOJOIN:
+                asyncio.ensure_future(autorejoin_vc(guild.id))
 
 
 @client.event
@@ -1052,6 +1600,9 @@ async def on_message(message):
             "DM me anything and I'll run it through opencode.\n"
             "`!new` - fresh session (plain message, not /new)\n"
             "`!status` - session, usage, inbox, queue\n"
+            "`!voice [on|off]` - spoken replies via Voicebox (Computer voice)\n"
+            "`!join` / `!leave` - speak replies in your voice channel (servers)\n"
+            "`!say <text>` - speak a line in VC now, no opencode call\n"
             f"`{GUILD_PREFIX} <prompt>` - use me in a server channel\n"
             "Attach + `place this in <dir>` saves files directly.\n"
             "`send me <path>` sends a file back directly.\n"
@@ -1090,13 +1641,141 @@ async def on_message(message):
         model = MODEL_OVERRIDES.get(key)
         model_s = model if model else (
             f"{OPENCODE_MODEL} (env)" if OPENCODE_MODEL else "opencode default")
+        voice_s = (f"on ({VOICEBOX_PROFILE})" if voice_enabled(key)
+                   else "off")
+        guild = getattr(message, "guild", None)
+        gvc = guild.voice_client if guild is not None else None
+        if gvc is not None and gvc.is_connected():
+            pending = (VC_QUEUES.get(guild.id).qsize()
+                       if VC_QUEUES.get(guild.id) else 0)
+            vc_s = (f"in #{gvc.channel.name} "
+                    f"({'speaking' if gvc.is_playing() else 'idle'}"
+                    f"{f', {pending} queued' if pending else ''})"
+                    if gvc.channel else "connected")
+        else:
+            vc_s = "not connected (`!join` in a server)"
+        try:
+            pending_say = sum(
+                1 for p in SAY_DIR.iterdir()
+                if p.is_file() and p.suffix.lower() == ".txt"
+                and not p.name.startswith(".")) if SAY_DIR_ENABLED else 0
+        except OSError:
+            pending_say = 0
         await message.channel.send(
             f"session `{sid}`\n"
             f"model: `{model_s}`\n"
+            f"voice: `{voice_s}`\n"
+            f"vc: `{vc_s}`\n"
+            f"say-queue: `{pending_say} pending`\n"
             f"turns: {u['turns']} | tokens: {u['in']} in / {u['out']} out | "
             f"cost: ${u['cost']:.4f}\n"
             f"inbox: {inbox_s}\n"
             f"queue: {queue_s}")
+        return
+
+    if content.lower() == "!voice" or content.lower().startswith("!voice "):
+        arg = content[6:].strip().lower()
+        if arg in ("on", "off"):
+            VOICE_OVERRIDES[key] = (arg == "on")
+            save_state()
+            log.info("[%s] voice override: %s", key, arg)
+            await message.channel.send(
+                f"voice replies {arg} for this chat.")
+        else:
+            state = "on" if voice_enabled(key) else "off"
+            await message.channel.send(
+                f"voice replies: `{state}` (profile `{VOICEBOX_PROFILE}`). "
+                "`!voice on` / `!voice off` to change.")
+        return
+
+    if content.lower() == "!join":
+        guild = getattr(message, "guild", None)
+        if guild is None:
+            await message.channel.send(
+                "voice channels only exist in servers - `!join` works in a "
+                "server channel, not DMs.")
+            return
+        vs = getattr(message.author, "voice", None)
+        target = vs.channel if vs else None
+        if target is None:
+            await message.channel.send(
+                "join a voice channel first, then `!join` to pull me in.")
+            return
+        if not ensure_opus():
+            await message.channel.send(
+                "voice audio library (Opus) isn't loaded - check the bot log "
+                "for the opus path it tried.")
+            return
+        try:
+            vc = guild.voice_client
+            if vc is not None and vc.is_connected():
+                if vc.channel is not None and vc.channel.id == target.id:
+                    await message.channel.send(
+                        f"already in `{target.name}` - replies are spoken there.")
+                else:
+                    await vc.move_to(target)
+                    log.info("[%s] VC moved to %s", key, target.name)
+                    await message.channel.send(
+                        f"moved to `{target.name}` - replies are spoken there.")
+            else:
+                await target.connect()
+                log.info("[%s] VC joined %s", key, target.name)
+                await message.channel.send(
+                    f"joined `{target.name}` - replies are spoken there, "
+                    "no file to click.")
+        except Exception as e:
+            log.exception("[%s] VC join failed", key)
+            await message.channel.send(f"could not join `{target.name}`: {e}")
+        return
+
+    if content.lower() in ("!leave", "!disconnect", "!stop"):
+        guild = getattr(message, "guild", None)
+        vc = guild.voice_client if guild is not None else None
+        if vc is None or not vc.is_connected():
+            await message.channel.send("not in a voice channel.")
+            return
+        try:
+            name = vc.channel.name if vc.channel else "voice"
+            VC_EXPECTED_BYE.add(guild.id)
+            vc_drop(guild.id)
+            try:
+                vc.stop()
+            except Exception:
+                pass
+            await vc.disconnect()
+            log.info("[%s] VC left %s", key, name)
+            await message.channel.send(
+                f"left `{name}` - back to reply.wav files.")
+        except Exception as e:
+            log.exception("[%s] VC leave failed", key)
+            await message.channel.send(f"could not leave: {e}")
+        return
+
+    if content.lower() == "!say" or content.lower().startswith("!say "):
+        line = content[4:].strip()
+        if not line:
+            await message.channel.send(
+                "usage: `!say <text>` - speaks in every connected voice "
+                "channel, no opencode call.")
+            return
+        live = connected_guild_ids()
+        if not live:
+            await message.channel.send(
+                "not in any voice channel - `!join` first.")
+            return
+        async with message.channel.typing():
+            wav = await asyncio.to_thread(tts_wav, line)
+        if not wav:
+            await message.channel.send("TTS failed - check the bot log.")
+            return
+        VC_TMP.mkdir(parents=True, exist_ok=True)
+        n = 0
+        for gid in live:
+            if await vc_say(gid, wav, VC_TMP):
+                n += 1
+        log.info("[%s] !say queued for %d guild(s): %r", key, n, line[:80])
+        await message.channel.send(
+            f"saying it in {n} voice channel(s).")
         return
 
     if content.lower() == "!model" or content.lower().startswith("!model "):
@@ -1161,6 +1840,7 @@ async def on_message(message):
         local_files = []
         saved_files = []
         attach_notes = []
+        stt_pending = []  # [(saved_path, filename, size, content_type)]
         for att in message.attachments:
             size_mb = (att.size or 0) / (1024 * 1024)
             log.info("[%s] inbound: %s (%d bytes, %s)",
@@ -1186,7 +1866,15 @@ async def on_message(message):
                 log.info("[%s] saved %d bytes -> %s",
                          key, dest.stat().st_size, dest.resolve())
                 saved_files.append(str(dest.resolve()))
-                if use_file_flag(att.filename, att.content_type):
+                if (VOICEBOX_TRANSCRIBE
+                        and is_audio_attachment(att.filename,
+                                                att.content_type)):
+                    # Transcribed after the drop check; the transcript (not
+                    # the raw bytes) is what opencode sees.
+                    stt_pending.append(
+                        (str(dest.resolve()), att.filename, att.size,
+                         att.content_type))
+                elif use_file_flag(att.filename, att.content_type):
                     local_files.append(str(dest.resolve()))
                     attach_notes.append(
                         f"[Attached file: {att.filename} ({att.size} bytes, "
@@ -1259,6 +1947,37 @@ async def on_message(message):
             return
 
         prompt = content
+        if stt_pending:
+            if status is not None:
+                try:
+                    await status.edit(
+                        content=f"transcribing {len(stt_pending)} voice "
+                                "message(s)...")
+                except Exception:
+                    pass
+            for saved_path, fname, fsize, fctype in stt_pending:
+                text, duration = await asyncio.to_thread(
+                    transcribe_audio_file, saved_path)
+                if text:
+                    attach_notes.append(
+                        f"[Voice message {fname} ({duration:.1f}s): {text}]")
+                else:
+                    # STT failed/down: fall back to the old raw-audio path.
+                    log.warning("[%s] STT fallback to --file: %s",
+                                key, fname)
+                    if use_file_flag(fname, fctype):
+                        local_files.append(saved_path)
+                    attach_notes.append(
+                        f"[Attached file: {fname} ({fsize} bytes, "
+                        f"{fctype or 'unknown type'}) saved at {saved_path} "
+                        f"(transcription unavailable)]")
+            if status is not None:
+                try:
+                    await status.edit(
+                        content=f"saved {len(saved_files)}/{len(message.attachments)} "
+                                "file(s), asking opencode...")
+                except Exception:
+                    pass
         if attach_notes:
             prompt = (prompt + "\n" if prompt else "") + "\n".join(attach_notes)
 
@@ -1280,4 +1999,5 @@ async def on_message(message):
 if __name__ == "__main__":
     if _TOKEN_ERROR:
         sys.exit(_TOKEN_ERROR)
+    ensure_opus()
     client.run(TOKEN)

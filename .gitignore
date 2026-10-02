@@ -4,3 +4,7 @@ __pycache__/
 .env.*
 state/
 attachments/
+say_queue/
+# Local Opus voice library (Windows). Not in pip; see OPUS_LIB in bot.py.
+libopus-0.x64.dll
+opus.dll
