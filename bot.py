@@ -637,6 +637,38 @@ class TurnQueue:
 QUEUES = {}
 
 
+# Reaction controls (issue #7): message_id -> info, so users can drive
+# the bot from reactions instead of typing.
+PROMPT_MSGS = {}  # prompt message id -> {"key": session key, "author_id": int}
+REPLY_MSGS = {}  # bot reply message id -> {"key", "author_id", "text", "prompt"}
+REGEN_PROMPTS = {}  # session key -> prompt text for 🔁 regeneration
+MAX_REPLY_MSGS = 50
+
+
+def _drop_prompt_msgs(key):
+    """Forget prompt-message mappings for a finished turn."""
+    for mid in [m for m, i in PROMPT_MSGS.items() if i["key"] == key]:
+        PROMPT_MSGS.pop(mid, None)
+
+
+def _record_reply(sent, key, messages, reply):
+    """Remember a posted bot reply for 🔊/🔁 reaction controls."""
+    try:
+        mid = sent.id
+    except Exception:
+        return
+    author_id = None
+    try:
+        if messages:
+            author_id = messages[0].author.id
+    except Exception:
+        pass
+    REPLY_MSGS[mid] = {"key": key, "author_id": author_id, "text": reply,
+                       "prompt": REGEN_PROMPTS.get(key)}
+    while len(REPLY_MSGS) > MAX_REPLY_MSGS:
+        REPLY_MSGS.pop(next(iter(REPLY_MSGS)), None)
+
+
 def get_queue(key):
     q = QUEUES.get(key)
     if q is None:
@@ -2008,12 +2040,14 @@ async def deliver_reply(key, channel, messages, reply, inbox, status):
             if first and messages and not _is_dm(channel):
                 first = False
                 try:
-                    await messages[0].reply(part)
+                    sent = await messages[0].reply(part)
+                    _record_reply(sent, key, messages, reply)
                     continue
                 except Exception as e:
                     log.warning("[%s] reply-thread failed, sending plain: %s",
                                 key, e)
-            await channel.send(part)
+            sent = await channel.send(part)
+            _record_reply(sent, key, messages, reply)
         if reply_file:
             try:
                 await channel.send(
@@ -2253,7 +2287,9 @@ async def run_batches(key, channel, q, batch, inbox, status):
                 remember_session(key, new_sid)
                 save_state()
                 log.info("[%s] session: %s", key, new_sid)
+            REGEN_PROMPTS[key] = "\n\n---\n\n".join(p for _, p, _ in batch)
             await deliver_reply(key, channel, msgs, reply, inbox, status)
+            REGEN_PROMPTS.pop(key, None)
             status = None
             async with q.guard:
                 if not q.buffer:
@@ -2270,6 +2306,7 @@ async def run_batches(key, channel, q, batch, inbox, status):
             stuck = [m for m, _, _ in q.buffer]
             q.buffer = []
             q.running = False
+        _drop_prompt_msgs(key)
         for m in stuck:
             await swap_react(m, REACT_START, REACT_ERROR)
         async with ACTIVE_GUARD:
@@ -2653,6 +2690,8 @@ async def handle_text_command(message, content, key):
             "Attach + `place this in <dir>` saves files directly.\n"
             "`send me <path>` sends a file back directly.\n"
             "Rapid messages merge into one follow-up - wait for the check.\n"
+            "Reactions: ❌ on your prompt cancels the turn; 🔊 / 🔁 on a\n"
+            "bot reply replay / regenerate it (author or DJ+ only).\n"
             "`/sessions` - browse and switch opencode sessions (servers).\n"
             "`/model` - switch the model for this chat.\n"
             "Slash equivalents (ephemeral replies): `/new` `/status`\n"
@@ -3027,6 +3066,96 @@ async def on_voice_state_update(member, before, after):
         _refresh_autoleave(gid)
 
 
+def _reaction_allowed(user, author_id):
+    """True when the reactor is the prompt author or DJ+. Never raises."""
+    try:
+        if str(user.id) == str(author_id):
+            return True
+        member = user if hasattr(user, "roles") else None
+        return role_tier(user.id, member) >= TIER_DJ
+    except Exception:
+        return False
+
+
+async def _replay_reply(reaction, info):
+    """🔊: re-speak a bot reply in VC (cheap via the TTS cache)."""
+    key = info["key"]
+    message = reaction.message
+    wav = await asyncio.to_thread(tts_wav, info["text"], key)
+    if not wav:
+        await message.channel.send("replay failed - TTS unavailable.")
+        return
+    guild = getattr(message, "guild", None)
+    vc = guild_voice_client(guild.id) if guild is not None else None
+    if vc is not None and vc.is_connected():
+        VC_TMP.mkdir(parents=True, exist_ok=True)
+        if await vc_say(guild.id, wav, VC_TMP):
+            log.info("[%s] replayed reply in VC (react)", key)
+            return
+    await message.channel.send(
+        file=discord.File(io.BytesIO(wav), filename="replay.wav"))
+
+
+async def _regen_reply(reaction, info):
+    """🔁: run a fresh opencode turn with the reply's original prompt."""
+    key = info["key"]
+    prompt = info.get("prompt")
+    if not prompt:
+        return
+    message = reaction.message
+    channel = message.channel
+    q = get_queue(key)
+    inbox = ATTACH_DIR / safe_key(key)
+    try:
+        inbox.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        pass
+    async with q.guard:
+        if q.running:
+            q.buffer.append((message, prompt, []))
+            log.info("[%s] regen coalesced into running turn", key)
+            return
+        q.running = True
+    PROMPT_MSGS[message.id] = {"key": key, "author_id": info["author_id"]}
+    if len(PROMPT_MSGS) > 500:
+        PROMPT_MSGS.pop(next(iter(PROMPT_MSGS)), None)
+    await run_batches(key, channel, q, [(message, prompt, [])], inbox, None)
+
+
+@client.event
+async def on_reaction_add(reaction, user):
+    # Reaction controls (issue #7): drive the bot from the message itself.
+    # ❌ on your prompt message = cancel the turn (ties into #1).
+    # 🔊 on a bot reply = replay its audio. 🔁 on a bot reply = regenerate.
+    # Only the prompt author or DJ+ can trigger; the bot's own reacts and
+    # reactions on untracked messages are ignored.
+    if getattr(user, "bot", False):
+        return
+    emoji = str(reaction.emoji)
+    if emoji == "❌":
+        info = PROMPT_MSGS.get(reaction.message.id)
+        if info is None:
+            return
+        if not _reaction_allowed(user, info["author_id"]):
+            log.info("reaction ❌ denied for %s (not author/DJ)",
+                     getattr(user, "id", "?"))
+            return
+        await cancel_turn(info["key"], reaction.message.channel)
+        return
+    if emoji in ("🔊", "🔁"):
+        info = REPLY_MSGS.get(reaction.message.id)
+        if info is None:
+            return
+        if not _reaction_allowed(user, info["author_id"]):
+            log.info("reaction %s denied for %s (not author/DJ)",
+                     emoji, getattr(user, "id", "?"))
+            return
+        if emoji == "🔊":
+            await _replay_reply(reaction, info)
+        else:
+            await _regen_reply(reaction, info)
+
+
 @client.event
 async def on_message(message):
     if message.author.bot:
@@ -3276,6 +3405,10 @@ async def on_message(message):
         log.info("[%s] opencode prompt: %d chars + %d files (--file=%s)",
                  key, len(prompt), len(local_files), local_files)
         log.debug("[%s] prompt attach notes:\n%s", key, "\n".join(attach_notes) or "(none)")
+        PROMPT_MSGS[message.id] = {"key": key,
+                                   "author_id": message.author.id}
+        if len(PROMPT_MSGS) > 500:
+            PROMPT_MSGS.pop(next(iter(PROMPT_MSGS)), None)
         q = get_queue(key)
         async with q.guard:
             if q.running:
