@@ -50,6 +50,12 @@ Config via env (or .env in cwd / ~/.config/opencode-discord/):
                         "0" = text-only unless a chat opts in with `!voice on`
     VOICEBOX_TIMEOUT    seconds per TTS request (default 120)
     VOICEBOX_MAX_CHARS  max chars sent to TTS per turn (default 1200, rest stays text-only)
+    VOICEBOX_CACHE_DIR  content-hash cache for TTS wav output (default
+                        "tts_cache"; empty disables). A hit skips Voicebox
+                        entirely - repeats (!say reruns, greetings, status
+                        phrases) cost nothing.
+    VOICEBOX_CACHE_FILES default 500 (cache prune: newest N kept, 0 = unlimited)
+    VOICEBOX_CACHE_MB   default 200 (cache prune: total MB cap, 0 = unlimited)
     VC_CHUNK_CHARS      max chars per spoken chunk when streaming to VC
                         (default 400; smaller = first audio sooner)
     VOICEBOX_TRANSCRIBE "1" = transcribe inbound voice notes/audio via Voicebox
@@ -85,6 +91,7 @@ Developer Portal -> Bot -> Privileged Gateway Intents).
 
 import asyncio
 import collections
+import hashlib
 import io
 import json
 import logging
@@ -194,6 +201,9 @@ VOICEBOX_PROFILE = os.environ.get("VOICEBOX_PROFILE", "Computer").strip()
 VOICEBOX_VOICE = os.environ.get("VOICEBOX_VOICE", "1") == "1"
 VOICEBOX_TIMEOUT = _env_int("VOICEBOX_TIMEOUT", 120)
 VOICEBOX_MAX_CHARS = _env_int("VOICEBOX_MAX_CHARS", 1200)
+VOICEBOX_CACHE_DIR = os.environ.get("VOICEBOX_CACHE_DIR", "tts_cache").strip()
+VOICEBOX_CACHE_FILES = _env_int("VOICEBOX_CACHE_FILES", 500)
+VOICEBOX_CACHE_MB = _env_int("VOICEBOX_CACHE_MB", 200)
 VOICEBOX_TRANSCRIBE = os.environ.get("VOICEBOX_TRANSCRIBE", "1") == "1"
 VOICEBOX_STT_MODEL = os.environ.get("VOICEBOX_STT_MODEL", "").strip()
 VOICEBOX_LANGUAGE = os.environ.get("VOICEBOX_LANGUAGE", "").strip()
@@ -837,8 +847,15 @@ def safe_key(key):
     return re.sub(r"[^A-Za-z0-9_-]+", "_", key)
 
 
-def prune_inbox(inbox, key="?"):
-    """Drop oldest inbox files beyond count/byte caps (reply leftovers too)."""
+def prune_inbox(inbox, key="?", keep_files=None, keep_mb=None):
+    """Drop oldest files beyond count/byte caps (reply leftovers too).
+
+    keep_files/keep_mb default to the ATTACH_KEEP_* globals; callers with
+    their own caps (e.g. the TTS cache) pass explicit values."""
+    if keep_files is None:
+        keep_files = ATTACH_KEEP_FILES
+    if keep_mb is None:
+        keep_mb = ATTACH_KEEP_MB
     try:
         files = sorted(
             (p for p in inbox.iterdir() if p.is_file()),
@@ -846,20 +863,20 @@ def prune_inbox(inbox, key="?"):
     except OSError:
         return
     pruned = 0
-    if ATTACH_KEEP_FILES > 0:
-        while len(files) > ATTACH_KEEP_FILES:
+    if keep_files > 0:
+        while len(files) > keep_files:
             old = files.pop(0)
             try:
                 old.unlink()
                 pruned += 1
             except OSError:
                 pass
-    if ATTACH_KEEP_MB > 0:
+    if keep_mb > 0:
         try:
             total = sum(p.stat().st_size for p in files)
         except OSError:
             total = 0
-        while files and total > ATTACH_KEEP_MB * 1024 * 1024:
+        while files and total > keep_mb * 1024 * 1024:
             old = files.pop(0)
             try:
                 total -= old.stat().st_size
@@ -868,7 +885,7 @@ def prune_inbox(inbox, key="?"):
             except OSError:
                 pass
     if pruned:
-        log.info("[%s] pruned %d old inbox file(s)", key, pruned)
+        log.info("[%s] pruned %d old file(s)", key, pruned)
 
 
 def split_attach_markers(reply):
@@ -1096,6 +1113,9 @@ def tts_wav_clean(text):
     pid = get_voicebox_profile_id()
     if not pid:
         return None
+    hit = _tts_cache_get(pid, text)
+    if hit is not None:
+        return hit
     payload = json.dumps(
         {"profile_id": pid, "text": text, "language": "en"}).encode()
     try:
@@ -1122,7 +1142,73 @@ def tts_wav_clean(text):
         return None
     log.info("voicebox TTS: %d chars -> %d bytes", len(text), len(body))
     note_voicebox_result(True)
+    _tts_cache_put(pid, text, body)
     return body
+
+
+def _tts_cache_key(profile_id, text):
+    """Content hash: identical (profile, text) hits, anything else misses."""
+    h = hashlib.sha256()
+    h.update(profile_id.encode("utf-8"))
+    h.update(b"\0")
+    h.update(text.encode("utf-8"))
+    return h.hexdigest()
+
+
+def _tts_cache_get(profile_id, text):
+    """Return cached wav bytes on hit, None on miss or corrupt entry.
+
+    Corrupt entries (shorter than the not-audio guard) are deleted, never
+    served — the caller falls through to a fresh TTS request."""
+    if not VOICEBOX_CACHE_DIR:
+        return None
+    path = Path(VOICEBOX_CACHE_DIR) / (_tts_cache_key(profile_id, text)
+                                      + ".wav")
+    try:
+        data = path.read_bytes()
+    except OSError:
+        log.debug("voicebox TTS cache miss")
+        return None
+    if len(data) < 1000:
+        try:
+            path.unlink()
+        except OSError:
+            pass
+        log.warning("voicebox TTS cache: dropped corrupt entry %s", path.name)
+        return None
+    try:
+        os.utime(path, None)  # recency for mtime-ordered pruning
+    except OSError:
+        pass
+    log.info("voicebox TTS cache hit: %d bytes", len(data))
+    return data
+
+
+def _tts_cache_put(profile_id, text, data):
+    """Store wav bytes under the content hash; prune to caps. Never raises."""
+    if not VOICEBOX_CACHE_DIR or not data:
+        return
+    cdir = Path(VOICEBOX_CACHE_DIR)
+    try:
+        cdir.mkdir(parents=True, exist_ok=True)
+        final = cdir / (_tts_cache_key(profile_id, text) + ".wav")
+        fd, tmp = tempfile.mkstemp(prefix="tts-", suffix=".wav",
+                                   dir=str(cdir))
+        try:
+            with os.fdopen(fd, "wb") as f:
+                f.write(data)
+            os.replace(tmp, final)  # atomic, Windows-safe
+        except Exception:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+            raise
+        prune_inbox(cdir, key="tts-cache",
+                    keep_files=VOICEBOX_CACHE_FILES,
+                    keep_mb=VOICEBOX_CACHE_MB)
+    except OSError as e:
+        log.warning("voicebox TTS cache write failed: %s", e)
 
 
 # Audio the bot transcribes via Voicebox instead of passing raw to opencode.

@@ -130,6 +130,8 @@ Spoken delivery, in order of preference:
 
 Per-chat control: `!voice off` mutes spoken replies entirely (VC or file), `!voice on` re-enables; `!voice` shows state. TTS failure never blocks the text reply.
 
+**TTS cache:** every spoken line is cached under `VOICEBOX_CACHE_DIR` (default `tts_cache/`) by content hash of (voice profile + text) — repeats (greetings, `!say` reruns, status phrases) skip Voicebox entirely, which also saves local GPU time. Hits/misses are logged. The cache prunes itself to `VOICEBOX_CACHE_FILES` (default 500) / `VOICEBOX_CACHE_MB` (default 200), newest kept; corrupt entries are deleted and regenerated, never served. Set `VOICEBOX_CACHE_DIR` empty to disable. Shared by turn replies, `!say`, the say-queue, and `[[say:]]` markers — they all funnel through one TTS call.
+
 **Staying in VC:** set `VC_AUTOJOIN` to a voice channel id and the bot joins it on startup and sits there until restart (`VC_AUTOREJOIN=1` rejoins after unexpected drops; `!leave` is still respected and sticks). Find the id by right-clicking the channel → Copy Channel ID (Developer Mode on).
 
 **Readiness gate:** `!voiceready` checks all four preconditions and reports `OK`/`FAIL` per line: Voicebox reachable (with ping ms), Discord gateway connected, bot in a VC, and you in the same VC (needs `VOICE_USER_ID` set, else skipped). Run it before a voice session instead of guessing.
