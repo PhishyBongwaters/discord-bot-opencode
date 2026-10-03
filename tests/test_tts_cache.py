@@ -107,6 +107,8 @@ class TtsWavCleanCache(unittest.TestCase):
         calls, urlopen = fake_tts()
         with mock.patch.object(bot, "get_voicebox_profile_id",
                                return_value="prof-1"), \
+             mock.patch.object(bot, "get_voicebox_profile_engine",
+                               return_value=None), \
              mock.patch("urllib.request.urlopen", urlopen):
             first = bot.tts_wav_clean("hello there")
             second = bot.tts_wav_clean("hello there")
@@ -118,6 +120,8 @@ class TtsWavCleanCache(unittest.TestCase):
         calls, urlopen = fake_tts()
         with mock.patch.object(bot, "get_voicebox_profile_id",
                                return_value="prof-1"), \
+             mock.patch.object(bot, "get_voicebox_profile_engine",
+                               return_value=None), \
              mock.patch("urllib.request.urlopen", urlopen):
             bot.tts_wav_clean("one")
             bot.tts_wav_clean("two")
@@ -128,6 +132,8 @@ class TtsWavCleanCache(unittest.TestCase):
         profiles = ["prof-1", "prof-2"]
         with mock.patch.object(bot, "get_voicebox_profile_id",
                                side_effect=profiles), \
+             mock.patch.object(bot, "get_voicebox_profile_engine",
+                               return_value=None), \
              mock.patch("urllib.request.urlopen", urlopen):
             bot.tts_wav_clean("same text")
             bot.tts_wav_clean("same text")

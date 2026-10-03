@@ -1289,7 +1289,7 @@ def clean_for_tts(reply):
 
 
 def list_voicebox_profiles():
-    """Fetch [(id, name)] from Voicebox. Empty list on any failure."""
+    """Fetch [(id, name, engine)] from Voicebox. Empty list on any failure."""
     if not VOICEBOX_URL:
         return []
     try:
@@ -1303,11 +1303,11 @@ def list_voicebox_profiles():
         return []
     if not isinstance(items, list):
         return []
-    return [(e.get("id"), e.get("name")) for e in items
-            if isinstance(e, dict)]
+    return [(e.get("id"), e.get("name"), e.get("default_engine"))
+            for e in items if isinstance(e, dict)]
 
 
-_VOICE_PROFILE_CACHE = {}  # profile name -> {"at": monotonic, "id": pid}
+_VOICE_PROFILE_CACHE = {}  # name -> {"at": monotonic, "id": pid, "engine": str|None}
 _VOICE_PROFILE_TTL = 3600
 
 
@@ -1320,19 +1320,30 @@ def _resolve_profile_name(name):
     if hit and now - hit["at"] < _VOICE_PROFILE_TTL:
         return hit["id"]
     items = list_voicebox_profiles()
-    for pid, pname in items:
+    for pid, pname, engine in items:
         if str(pid) == name:
-            _VOICE_PROFILE_CACHE[name] = {"at": now, "id": pid}
+            _VOICE_PROFILE_CACHE[name] = {"at": now, "id": pid,
+                                          "engine": engine}
             return pid
     want = name.lower()
-    for pid, pname in items:
+    for pid, pname, engine in items:
         if str(pname or "").lower() == want:
-            _VOICE_PROFILE_CACHE[name] = {"at": now, "id": pid}
+            _VOICE_PROFILE_CACHE[name] = {"at": now, "id": pid,
+                                          "engine": engine}
             log.info("voicebox profile %r -> %s", pname, pid)
             return pid
     log.warning("voicebox profile %r not found (%d profiles)",
                 name, len(items))
     return None
+
+
+def get_voicebox_profile_engine(name):
+    """default_engine for a profile name-or-id. None when unknown/unset."""
+    if not name:
+        return None
+    _resolve_profile_name(name)
+    hit = _VOICE_PROFILE_CACHE.get(name)
+    return hit.get("engine") if hit else None
 
 
 def get_voicebox_profile_id(key=None):
@@ -1351,19 +1362,27 @@ def tts_wav_clean(text, key=None):
     """Blocking Voicebox TTS of pre-cleaned text. None on any failure."""
     if not VOICEBOX_URL or not (text or "").strip():
         return None
-    return tts_wav_clean_pid(text.strip(), get_voicebox_profile_id(key))
+    name = effective_voice_profile(key)
+    return tts_wav_clean_pid(text.strip(), get_voicebox_profile_id(key),
+                             get_voicebox_profile_engine(name))
 
 
-def tts_wav_clean_pid(text, pid):
-    """Blocking Voicebox TTS with an explicit profile id. None on failure."""
+def tts_wav_clean_pid(text, pid, engine=None):
+    """Blocking Voicebox TTS with an explicit profile id. None on failure.
+
+    `engine` is sent only when it differs from the server default
+    ("qwen"): preset voices (e.g. kokoro) 400 without their engine,
+    while default-voice payloads stay byte-identical to before."""
     if not VOICEBOX_URL or not (text or "").strip() or not pid:
         return None
     text = text.strip()
     hit = _tts_cache_get(pid, text)
     if hit is not None:
         return hit
-    payload = json.dumps(
-        {"profile_id": pid, "text": text, "language": "en"}).encode()
+    payload = {"profile_id": pid, "text": text, "language": "en"}
+    if engine and engine != "qwen":
+        payload["engine"] = engine
+    payload = json.dumps(payload).encode()
     try:
         req = urllib.request.Request(
             f"{VOICEBOX_URL}/generate/stream", data=payload,
@@ -1408,7 +1427,11 @@ def tts_wav_profile(text, profile_name):
         pid = get_voicebox_profile_id()
         if not pid:
             return None
-    return tts_wav_clean_pid(cleaned, pid)
+        return tts_wav_clean_pid(cleaned, pid,
+                                 get_voicebox_profile_engine(
+                                     effective_voice_profile(None)))
+    return tts_wav_clean_pid(cleaned, pid,
+                             get_voicebox_profile_engine(profile_name))
 
 
 def _tts_cache_key(profile_id, text):
@@ -3449,7 +3472,7 @@ async def handle_text_command(message, content, key):
         pid = await asyncio.to_thread(_resolve_profile_name, arg)
         if pid is None:
             items = await asyncio.to_thread(list_voicebox_profiles)
-            names = ", ".join(f"`{n}`" for _, n in items if n)
+            names = ", ".join(f"`{n}`" for _, n, _e in items if n)
             await message.channel.send(
                 f"unknown voice profile `{arg}` - available: "
                 f"{names or '(none found)'}.")
