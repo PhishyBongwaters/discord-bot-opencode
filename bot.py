@@ -1367,18 +1367,20 @@ def tts_wav_clean(text, key=None):
                              get_voicebox_profile_engine(name))
 
 
-def tts_wav_clean_pid(text, pid, engine=None):
+def tts_wav_clean_pid(text, pid, engine=None, use_cache=True):
     """Blocking Voicebox TTS with an explicit profile id. None on failure.
 
     `engine` is sent only when it differs from the server default
     ("qwen"): preset voices (e.g. kokoro) 400 without their engine,
-    while default-voice payloads stay byte-identical to before."""
+    while default-voice payloads stay byte-identical to before.
+    `use_cache=False` skips the cache both ways (keep-warm probes)."""
     if not VOICEBOX_URL or not (text or "").strip() or not pid:
         return None
     text = text.strip()
-    hit = _tts_cache_get(pid, text)
-    if hit is not None:
-        return hit
+    if use_cache:
+        hit = _tts_cache_get(pid, text)
+        if hit is not None:
+            return hit
     payload = {"profile_id": pid, "text": text, "language": "en"}
     if engine and engine != "qwen":
         payload["engine"] = engine
@@ -1407,7 +1409,8 @@ def tts_wav_clean_pid(text, pid, engine=None):
         return None
     log.info("voicebox TTS: %d chars -> %d bytes", len(text), len(body))
     note_voicebox_result(True)
-    _tts_cache_put(pid, text, body)
+    if use_cache:
+        _tts_cache_put(pid, text, body)
     return body
 
 
@@ -1620,12 +1623,58 @@ def _whisper_loaded_from_status(obj):
     return False
 
 
+def _kokoro_loaded_from_status(obj):
+    """True/False from the kokoro entry; None when there is no entry."""
+    try:
+        models = obj.get("models") if isinstance(obj, dict) else None
+    except AttributeError:
+        return None
+    if not isinstance(models, list):
+        return None
+    for m in models:
+        if isinstance(m, dict) and m.get("model_name") == "kokoro":
+            return bool(m.get("loaded"))
+    return None
+
+
+def _voicebox_status():
+    """Full /models/status payload, or None. Never raises."""
+    return _voicebox_get_json("/models/status")
+
+
 def voicebox_whisper_loaded():
     """Whisper residency from /models/status. True/False/None (unknown)."""
-    obj = _voicebox_get_json("/models/status")
+    obj = _voicebox_status()
     if obj is None:
         return None
     return _whisper_loaded_from_status(obj)
+
+
+def voicebox_kokoro_loaded():
+    """Kokoro residency. True/False; None when unknown or no kokoro entry."""
+    obj = _voicebox_status()
+    if obj is None:
+        return None
+    return _kokoro_loaded_from_status(obj)
+
+
+def voicebox_warm_kokoro():
+    """Synthesize one short line with a kokoro preset to (re)load it.
+
+    Returns True when audio came back, or when no kokoro preset exists
+    (nothing to warm). Cache-bypassed so it always touches the engine.
+    Never raises."""
+    if not VOICEBOX_URL:
+        return False
+    pid = None
+    for cid, _name, engine in list_voicebox_profiles():
+        if engine == "kokoro" and cid:
+            pid = cid
+            break
+    if pid is None:
+        return True  # no kokoro voice installed: nothing to warm
+    wav = tts_wav_clean_pid("Warmup.", pid, "kokoro", use_cache=False)
+    return wav is not None
 
 
 def voicebox_load_tts():
@@ -1715,13 +1764,14 @@ def voicebox_probe_stt():
 
 
 async def ensure_voice_models(source):
-    """Make sure TTS + Whisper are resident. Returns (tts_ok, stt_ok, acted).
+    """Make sure TTS + Whisper + Kokoro are resident.
 
-    Status-driven: cheap /health + /models/status checks first, loads
-    only what actually lapsed. `source` labels the log line
-    (startup/join/keepalive). Never raises."""
+    Returns (tts_ok, stt_ok, kokoro_ok, acted). Status-driven: cheap
+    /health + /models/status checks first, loads only what actually
+    lapsed. `source` labels the log line (startup/join/keepalive).
+    Never raises."""
     acted = []
-    tts_ok = stt_ok = False
+    tts_ok = stt_ok = kokoro_ok = False
     try:
         tts_loaded = await asyncio.to_thread(voicebox_tts_loaded)
         if tts_loaded:
@@ -1731,7 +1781,12 @@ async def ensure_voice_models(source):
             tts_ok = await asyncio.to_thread(voicebox_load_tts)
             if tts_ok:
                 acted.append("tts")
-        whisper_loaded = await asyncio.to_thread(voicebox_whisper_loaded)
+        status = await asyncio.to_thread(_voicebox_status)
+        if status is None:
+            whisper_loaded = kokoro_loaded = None
+        else:
+            whisper_loaded = _whisper_loaded_from_status(status)
+            kokoro_loaded = _kokoro_loaded_from_status(status)
         if whisper_loaded:
             stt_ok = True
         elif whisper_loaded is False:
@@ -1739,14 +1794,23 @@ async def ensure_voice_models(source):
             stt_ok, _dt = await asyncio.to_thread(voicebox_probe_stt)
             if stt_ok:
                 acted.append("stt")
-        if tts_loaded is None or whisper_loaded is None:
+        if kokoro_loaded:
+            kokoro_ok = True
+        elif kokoro_loaded is False:
+            log.info("voice warm (%s): kokoro cold, warming...", source)
+            kokoro_ok = await asyncio.to_thread(voicebox_warm_kokoro)
+            if kokoro_ok:
+                acted.append("kokoro")
+        else:
+            kokoro_ok = True  # unknown or no kokoro entry: nothing to do
+        if tts_loaded is None or status is None:
             note_voicebox_result(False)
             log.warning("voice warm (%s): voicebox unreachable", source)
         else:
             note_voicebox_result(True)
     except Exception as e:
         log.warning("voice warm (%s) failed: %s", source, e)
-    return tts_ok, stt_ok, acted
+    return tts_ok, stt_ok, kokoro_ok, acted
 
 
 VOICE_WARM_LAST = {"t": 0.0}
@@ -1778,7 +1842,7 @@ def keepalive_wanted():
         and voice_mode_on()
 
 
-KEEPALIVE_STATE = {"tts": None, "stt": None}
+KEEPALIVE_STATE = {"tts": None, "stt": None, "kokoro": None}
 
 
 async def voice_keepalive():
@@ -1798,11 +1862,16 @@ async def voice_keepalive():
         if not voice_mode_on():
             continue
         try:
-            tts_ok, stt_ok, acted = await ensure_voice_models("keepalive")
-            prev = (KEEPALIVE_STATE["tts"], KEEPALIVE_STATE["stt"])
-            KEEPALIVE_STATE["tts"], KEEPALIVE_STATE["stt"] = tts_ok, stt_ok
-            if acted or (prev != (None, None) and prev != (tts_ok, stt_ok)):
-                log.info("voice keepalive: tts=%s stt=%s%s", tts_ok, stt_ok,
+            tts_ok, stt_ok, kokoro_ok, acted = \
+                await ensure_voice_models("keepalive")
+            prev = (KEEPALIVE_STATE["tts"], KEEPALIVE_STATE["stt"],
+                    KEEPALIVE_STATE["kokoro"])
+            KEEPALIVE_STATE["tts"], KEEPALIVE_STATE["stt"], \
+                KEEPALIVE_STATE["kokoro"] = tts_ok, stt_ok, kokoro_ok
+            cur = (tts_ok, stt_ok, kokoro_ok)
+            if acted or (prev != (None, None, None) and prev != cur):
+                log.info("voice keepalive: tts=%s stt=%s kokoro=%s%s",
+                         tts_ok, stt_ok, kokoro_ok,
                          f" (reloaded: {','.join(acted)})" if acted else "")
         except Exception as e:
             log.warning("voice keepalive failed: %s", e)
@@ -2322,14 +2391,16 @@ async def warmup_voice():
     if not VOICEBOX_WARMUP or not VOICEBOX_URL:
         return
     t0 = time.monotonic()
-    tts_ok, stt_ok, acted = await ensure_voice_models("startup")
+    tts_ok, stt_ok, kokoro_ok, acted = await ensure_voice_models("startup")
     dt = time.monotonic() - t0
-    if tts_ok and stt_ok:
-        log.info("voice warmup: tts+stt ready in %.1fs%s", dt,
+    if tts_ok and stt_ok and kokoro_ok:
+        log.info("voice warmup: tts+stt+kokoro ready in %.1fs%s", dt,
                  f" (loaded: {','.join(acted)})" if acted else "")
     else:
-        log.warning("voice warmup incomplete after %.1fs (tts=%s stt=%s) - "
-                    "first reply may pay load cost", dt, tts_ok, stt_ok)
+        log.warning("voice warmup incomplete after %.1fs "
+                    "(tts=%s stt=%s kokoro=%s) - "
+                    "first reply may pay load cost",
+                    dt, tts_ok, stt_ok, kokoro_ok)
 
 
 async def autorejoin_vc(guild_id, delay=10):

@@ -119,34 +119,97 @@ class KeepaliveGate(unittest.TestCase):
 
 
 class EnsureRouting(unittest.TestCase):
-    def run_ensure(self, tts_loaded, whisper_loaded):
+    def run_ensure(self, tts_loaded, whisper_loaded, kokoro_loaded=True):
         with mock.patch.object(bot, "voicebox_tts_loaded",
                                return_value=tts_loaded), \
-             mock.patch.object(bot, "voicebox_whisper_loaded",
-                               return_value=whisper_loaded), \
+             mock.patch.object(bot, "_voicebox_status",
+                               return_value=status_obj(
+                                   ("whisper-base", whisper_loaded),
+                                   ("kokoro", kokoro_loaded))), \
              mock.patch.object(bot, "voicebox_load_tts",
                                return_value=True) as load, \
              mock.patch.object(bot, "voicebox_probe_stt",
-                               return_value=(True, 0.1)) as probe:
-            return asyncio.run(bot.ensure_voice_models("test")), load, probe
+                               return_value=(True, 0.1)) as probe, \
+             mock.patch.object(bot, "voicebox_warm_kokoro",
+                               return_value=True) as warm:
+            return (asyncio.run(bot.ensure_voice_models("test")),
+                    load, probe, warm)
 
     def test_all_warm_loads_nothing(self):
-        (tts_ok, stt_ok, acted), load, probe = self.run_ensure(True, True)
-        self.assertEqual((tts_ok, stt_ok, acted), (True, True, []))
+        (tts_ok, stt_ok, kokoro_ok, acted), load, probe, warm = \
+            self.run_ensure(True, True, True)
+        self.assertEqual((tts_ok, stt_ok, kokoro_ok, acted),
+                         (True, True, True, []))
         load.assert_not_called()
         probe.assert_not_called()
+        warm.assert_not_called()
 
     def test_cold_models_reloaded(self):
-        (tts_ok, stt_ok, acted), load, probe = self.run_ensure(False, False)
-        self.assertEqual((tts_ok, stt_ok, acted), (True, True, ["tts", "stt"]))
+        (tts_ok, stt_ok, kokoro_ok, acted), load, probe, warm = \
+            self.run_ensure(False, False, False)
+        self.assertEqual((tts_ok, stt_ok, kokoro_ok, acted),
+                         (True, True, True, ["tts", "stt", "kokoro"]))
         load.assert_called_once()
         probe.assert_called_once()
+        warm.assert_called_once()
 
     def test_unreachable_is_not_ok(self):
-        (tts_ok, stt_ok, acted), load, probe = self.run_ensure(None, None)
-        self.assertEqual((tts_ok, stt_ok, acted), (False, False, []))
+        with mock.patch.object(bot, "voicebox_tts_loaded",
+                               return_value=None), \
+             mock.patch.object(bot, "_voicebox_status",
+                               return_value=None), \
+             mock.patch.object(bot, "voicebox_load_tts") as load, \
+             mock.patch.object(bot, "voicebox_probe_stt") as probe, \
+             mock.patch.object(bot, "voicebox_warm_kokoro") as warm:
+            result = asyncio.run(bot.ensure_voice_models("test"))
+        self.assertEqual(result, (False, False, True, []))
         load.assert_not_called()
         probe.assert_not_called()
+        warm.assert_not_called()
+
+
+class KokoroStatusParse(unittest.TestCase):
+    def test_loaded(self):
+        self.assertTrue(bot._kokoro_loaded_from_status(
+            status_obj(("kokoro", True))))
+
+    def test_unloaded(self):
+        self.assertFalse(bot._kokoro_loaded_from_status(
+            status_obj(("kokoro", False))))
+
+    def test_no_entry_is_none(self):
+        self.assertIsNone(bot._kokoro_loaded_from_status(
+            status_obj(("qwen-tts-1.7B", True))))
+        for bad in (None, {}, {"models": None}):
+            self.assertIsNone(bot._kokoro_loaded_from_status(bad))
+
+
+class KokoroWarm(unittest.TestCase):
+    def test_no_preset_means_nothing_to_do(self):
+        with mock.patch.object(bot, "list_voicebox_profiles",
+                               return_value=[("id-c", "Computer", None)]), \
+             mock.patch.object(bot, "tts_wav_clean_pid",
+                               side_effect=AssertionError("no synth")), \
+             mock.patch.object(bot, "VOICEBOX_URL", "http://x"):
+            self.assertTrue(bot.voicebox_warm_kokoro())
+
+    def test_preset_warmed_cache_bypassed(self):
+        with mock.patch.object(bot, "list_voicebox_profiles",
+                               return_value=[("id-n", "Nicole", "kokoro")]), \
+             mock.patch.object(bot, "tts_wav_clean_pid",
+                               return_value=b"WAV") as synth, \
+             mock.patch.object(bot, "VOICEBOX_URL", "http://x"):
+            self.assertTrue(bot.voicebox_warm_kokoro())
+            synth.assert_called_once_with("Warmup.", "id-n", "kokoro",
+                                          use_cache=False)
+
+    def test_failed_synth_is_not_ok(self):
+        with mock.patch.object(bot, "list_voicebox_profiles",
+                               return_value=[("id-n", "Nicole", "kokoro")]), \
+             mock.patch.object(bot, "tts_wav_clean_pid",
+                               return_value=None), \
+             mock.patch.object(bot, "VOICEBOX_URL", "http://x"):
+            self.assertFalse(bot.voicebox_warm_kokoro())
 
 
 if __name__ == "__main__":
