@@ -1,7 +1,7 @@
 ---
 name: discord-voice
-description: "Speak in the Discord voice channel via the bot's say-queue, check voice status, and understand the Voicebox voice loop (TTS replies, STT voice notes)."
-version: 1.0.0
+description: "Speak in the Discord voice channel via the bot's say-queue, check voice status, pick voices, and understand the Voicebox voice loop (TTS replies, STT voice notes)."
+version: 1.1.0
 author: Hermes Agent
 license: MIT
 metadata:
@@ -30,6 +30,10 @@ deletes it:
 - `<profile>__*.txt` speaks it in another voice, e.g. `nicole__line.txt`
   (combine: `<guildid>_<profile>__*.txt`). Unknown names fall back to
   the default voice with a log warning. Each voice caches separately.
+- Voices: `Computer` (default) plus presets `Nicole`, `River`, `Sarah`,
+  `Sky`, `Bella` — and any cloned voice added in Voicebox. To see the
+  live list, send `!voiceprofile <badname>` in Discord; the rejection
+  message prints every available name.
 - Keep it short (a sentence or two ≈ 5s of speech). Files over
   `SAY_MAX_BYTES` (8192) are skipped; speech truncates at
   `VOICEBOX_MAX_CHARS` (1200) — full text still posts to chat for replies.
@@ -90,7 +94,8 @@ path. STT failure falls back to `--file`, never silence.
 
 - `[[attach:FULL_PATH]]` — upload a file, stripped from text.
 - `[[say:line]]` (max 3/turn) — spoken-only aside, stripped from text,
-  played first in VC when live, else folded into `reply.wav`.
+  played first in VC when live (in the chat's voice), else folded into
+  `reply.wav`.
 - `[[react:EMOJI]]` (max 5/turn) — react to the user's message.
 - The bridge prompt tells the model its reply will be heard (VC live vs
   audio file), so it front-loads conclusions and keeps code in files.
@@ -121,9 +126,9 @@ screen-share: human replies go to voice, technical work stays in text.
 
 1. Say-queue files are fire-and-forget: no confirmation except deletion.
    For must-confirm lines, check the bot log.
-2. First TTS/STT after Voicebox restart is slow (model load); Whisper may
-   return empty once while downloading — the bot retries once, then falls
-   back.
+2. First TTS/STT after a Voicebox restart is slow (model load) unless
+   keep-warm already reloaded it; Whisper may return empty once while
+   downloading — the bot retries once, then falls back.
 3. The bot only speaks when a VC is connected. DMs always get `reply.wav`.
 4. Anyone with shell access to the bot host can make it speak — same trust
    level as `OPENCODE_AUTO=1`. Never speak secrets aloud; VC audio is heard
