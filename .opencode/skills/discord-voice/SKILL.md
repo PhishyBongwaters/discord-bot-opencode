@@ -11,9 +11,9 @@ metadata:
 
 # Discord Voice
 
-Speak out loud in the server's voice channel (General) through the
+Speak out loud in the server's voice channel through the
 discord-bot + Voicebox loop. The bot sits in VC persistently (VC_AUTOJOIN)
-and speaks every reply in the Computer voice.
+and speaks every reply in the configured voice.
 
 ## Speak from a shell/agent session (primary path)
 
@@ -22,11 +22,11 @@ no opencode call. The bot's watcher picks it up within ~2s, speaks it,
 deletes it:
 
 ```
-D:\Projects\discord-bot\say_queue\
+<repo>/say_queue/
 ```
 
-- Plain `*.txt` plays in every connected VC (this server has one).
-- `<guildid>_*.txt` targets one server, e.g. `1513943523043446987_note.txt`.
+- Plain `*.txt` plays in every connected VC.
+- `<guildid>_*.txt` targets one server, e.g. `<guildid>_note.txt`.
 - Keep it short (a sentence or two ≈ 5s of speech). Files over
   `SAY_MAX_BYTES` (8192) are skipped; speech truncates at
   `VOICEBOX_MAX_CHARS` (1200) — full text still posts to chat for replies.
@@ -67,7 +67,8 @@ toggle — a down bot simply produces no voice until restarted.
 ## Inbound (how users talk back)
 
 Users record Discord voice notes; the bot transcribes via Voicebox Whisper
-and opencode sees `[Voice message NAME (Ns): transcript]`. There is NO live
+and opencode sees `[Voice message NAME (Ns): transcript]`. In servers,
+voice notes don't need `@bot`/`!oc` — anything else still does. There is NO live
 VC listening (discord.py cannot receive audio) — voice notes are the input
 path. STT failure falls back to `--file`, never silence.
 
@@ -89,7 +90,7 @@ screen-share: human replies go to voice, technical work stays in text.
 - **Voice (say-queue):** 1–3 sentences, conversational, plain words. Status,
   summaries, questions, completion notices. No code, no paths, no URLs, no
   numbers-as-data, no markdown, no emoji — say "the bot file", not
-  `D:\Projects\discord-bot\bot.py`. One drop per turn max unless something
+  `bot.py` or a full path. One drop per turn max unless something
   genuinely needs interrupting; milestones over micro-steps.
 - **Text (chat reply):** everything technical — code blocks, diffs, logs,
   exact commands, config values, file paths.

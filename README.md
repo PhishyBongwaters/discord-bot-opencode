@@ -31,16 +31,19 @@ Two-way chat between Discord and opencode. DM the bot, it forwards to `opencode 
    ```
    pip install -r requirements.txt
    ```
-3. Configure (`.env` in this dir, or env vars):
+3. Configure (`.env` in this dir, or env vars — see `sample.env`
+   for every knob):
    ```
    DISCORD_BOT_TOKEN=...
-   ALLOWED_USER_IDS=243337216758120448
-   DEFAULT_DISCORD_CHANNEL=1513943523894759606
-   OPENCODE_BIN=C:\Users\macdo\AppData\Roaming\npm\opencode.cmd
-   OPENCODE_DIR=D:\Projects\discord-bot
+   ALLOWED_USER_IDS=<your-discord-user-id>
+   DEFAULT_DISCORD_CHANNEL=<channel-id>
+   OPENCODE_BIN=opencode
+   OPENCODE_DIR=<path/to/workdir>
    OPENCODE_AUTO=1
    LOG_LEVEL=INFO
    ```
+   (`OPENCODE_BIN`: full path when not on PATH — e.g. Windows
+   `%AppData%\npm\opencode.cmd`, macOS/Linux `~/.npm-global/bin/opencode`.)
 4. Run:
    ```
    python bot.py
@@ -110,13 +113,13 @@ Two-way chat between Discord and opencode. DM the bot, it forwards to `opencode 
 
 ## Attachments
 
-**Direct drop (no model involved):** attach file(s) with `place / put / save / drop / move / copy this in(to) <dir>` (e.g. `Place this in d:/projects`). The bot saves to `attachments/<dm_or_channel>/`, creates the target dir, moves the files, and confirms. opencode is never called, so filename/content moderation can't refuse.
+**Direct drop (no model involved):** attach file(s) with `place / put / save / drop / move / copy this in(to) <dir>` (e.g. `Place this in /path/to/dir`). The bot saves to `attachments/<dm_or_channel>/`, creates the target dir, moves the files, and confirms. opencode is never called, so filename/content moderation can't refuse.
 
-**Direct send (no model involved):** `send me D:\files\clip.mp4` (or `send <path>`) with no attachments uploads that path straight via `discord.File`. If the text isn't an existing file path, it falls through to opencode as normal chat.
+**Direct send (no model involved):** `send me /path/to/clip.mp4` (or `send <path>`) with no attachments uploads that path straight via `discord.File`. If the text isn't an existing file path, it falls through to opencode as normal chat.
 
 **Via opencode:** files save to `attachments/<dm_or_channel>/` and the local path is added to the prompt. Text/code/images (incl. gif) are also passed with `opencode run --file`. True video (`mp4/mov/mkv/avi/webm/m4v/mpg/mpeg/wmv/flv`, any `video/*`) contributes **extracted still frames** via `--file` (`VIDEO_THUMB_FRAMES`, default 4, one every `VIDEO_THUMB_EVERY_S` seconds default 5; videos over `VIDEO_THUMB_MAX_MB`, default 200, get at most 2) so the model sees the content — the full file is still saved locally with its path in the prompt note for shell/file tools. If `ffmpeg` is missing, a frame fails, or `VIDEO_THUMB_FRAMES=0`, the video falls back to pure path-only (never breaks the turn). Audio notes (`ogg/opus/mp3/wav/m4a/flac/aac/webm`, any `audio/*`) are **transcribed** via Voicebox first — opencode sees `[Voice message NAME (Ns): transcript]`, never the raw bytes (falls back to `--file` if transcription fails).
 
-**Outbound via opencode:** the model emits `[[attach:D:\files\clip.mp4]]` on its own line; the bot strips the marker and uploads. Markers pointing at nonexistent files are silently skipped (quoted doc examples must never spam the channel); oversize files come back as text errors. `[[say:Deploy complete.]` (max 3 per turn) is a spoken-only aside — stripped from text, played in VC when live, else folded into `reply.wav`. The model can also react to your message with `[[react:EMOJI]]` (literal emoji, or custom `<:name:id>`; max 5 per turn, invalid ones are skipped with a console warning).
+**Outbound via opencode:** the model emits `[[attach:/path/to/clip.mp4]]` on its own line; the bot strips the marker and uploads. Markers pointing at nonexistent files are silently skipped (quoted doc examples must never spam the channel); oversize files come back as text errors. `[[say:Deploy complete.]` (max 3 per turn) is a spoken-only aside — stripped from text, played in VC when live, else folded into `reply.wav`. The model can also react to your message with `[[react:EMOJI]]` (literal emoji, or custom `<:name:id>`; max 5 per turn, invalid ones are skipped with a console warning).
 
 Model-driven moves/writes require `OPENCODE_AUTO=1` (or an agent that can approve file tools).
 
@@ -203,7 +206,7 @@ altered behavior; fix the code or file a new issue, not the test.
 ## Troubleshooting
 
 - **"application did not respond"**: the slash command sync hasn't propagated yet (global sync for DMs can take up to an hour). `!new` as a plain message always works.
-- **"unable to help" / content refusal on file moves**: use the direct drop form (attach + `Place this in d:/projects`) — it bypasses the model entirely. Same for sends: `send me D:\files\clip.mp4` uploads without asking the model.
+- **"unable to help" / content refusal on file moves**: use the direct drop form (attach + `Place this in /path/to/dir`) — it bypasses the model entirely. Same for sends: `send me /path/to/clip.mp4` uploads without asking the model.
 - **"I don't see any file" / stuck refusal**: the opencode session predates the fix or a failed turn. Send `!new`, then resend the file fresh. Session continuity (`--session`) keeps old context otherwise.
 - **`mkgy2(1)(2)(3).gif`**: same filename re-sent repeatedly; the inbox dedups instead of overwriting. Safe to delete `attachments/` contents.
 - **My messages got answered together**: that's coalescing — arrivals during a running turn merge into one follow-up. Wait for the check react between messages for separate turns.

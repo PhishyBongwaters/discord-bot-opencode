@@ -437,7 +437,7 @@ def resolve_target_dir(path_str):
     return p
 
 
-# Marker the model emits to send a file back: [[attach:D:\files\clip.mp4]]
+# Marker the model emits to send a file back: [[attach:/path/to/clip.mp4]]
 ATTACH_RE = re.compile(r"\[\[attach:(.+?)\]\]", re.IGNORECASE)
 
 # Marker the model emits to react to the user's message: [[react:EMOJI]]
@@ -533,7 +533,7 @@ BRIDGE_NOTE = (
     "the transcript appears as [Voice message NAME (Ns): text]; treat it as "
     "what the user said. "
     "To send a file back to the user, put [[attach:FULL_PATH]] on its own "
-    "line, e.g. [[attach:D:\\files\\clip.mp4]]. Use absolute paths.]"
+    "line, e.g. [[attach:/path/to/clip.mp4]]. Use absolute paths.]"
 )
 
 BRIDGE_VOICE_NOTE = (
