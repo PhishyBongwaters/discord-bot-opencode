@@ -3498,6 +3498,28 @@ async def on_reaction_add(reaction, user):
             await _regen_reply(reaction, info)
 
 
+def guild_message_addressed(message, content):
+    """True when a guild message is meant for the bot.
+
+    @mention or !oc prefix always count. Voice notes carry no text, so
+    they can never include either — audio attachments count on their own
+    when STT is enabled, otherwise they would be silently dropped.
+    """
+    mentioned = client.user in (getattr(message, "mentions", None) or [])
+    prefixed = (content or "").startswith(GUILD_PREFIX)
+    if mentioned or prefixed:
+        return True
+    if not VOICEBOX_TRANSCRIBE:
+        return False
+    return any(
+        is_audio_attachment(
+            getattr(a, "filename", ""),
+            getattr(a, "content_type", None),
+        )
+        for a in (getattr(message, "attachments", None) or [])
+    )
+
+
 @client.event
 async def on_message(message):
     if message.author.bot:
@@ -3509,24 +3531,9 @@ async def on_message(message):
     content = message.content.strip()
 
     if not is_dm:
-        mentioned = client.user in message.mentions
-        prefixed = content.startswith(GUILD_PREFIX)
-        # Voice notes carry no text, so they can never include @mention or
-        # !oc prefix. Let audio attachments through on their own when STT
-        # is enabled; otherwise they would be silently dropped.
-        has_voice_note = (
-            VOICEBOX_TRANSCRIBE
-            and any(
-                is_audio_attachment(
-                    getattr(a, "filename", ""),
-                    getattr(a, "content_type", None),
-                )
-                for a in (message.attachments or [])
-            )
-        )
-        if not (mentioned or prefixed or has_voice_note):
+        if not guild_message_addressed(message, content):
             return
-        if prefixed:
+        if content.startswith(GUILD_PREFIX):
             content = content[len(GUILD_PREFIX):].strip()
         # strip a leading mention
         content = re.sub(rf"^<@!?{client.user.id}>\s*", "", content).strip()
