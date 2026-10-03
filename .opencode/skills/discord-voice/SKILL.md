@@ -27,6 +27,9 @@ deletes it:
 
 - Plain `*.txt` plays in every connected VC.
 - `<guildid>_*.txt` targets one server, e.g. `<guildid>_note.txt`.
+- `<profile>__*.txt` speaks it in another voice, e.g. `nicole__line.txt`
+  (combine: `<guildid>_<profile>__*.txt`). Unknown names fall back to
+  the default voice with a log warning. Each voice caches separately.
 - Keep it short (a sentence or two ≈ 5s of speech). Files over
   `SAY_MAX_BYTES` (8192) are skipped; speech truncates at
   `VOICEBOX_MAX_CHARS` (1200) — full text still posts to chat for replies.

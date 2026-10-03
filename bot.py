@@ -1351,10 +1351,14 @@ def tts_wav_clean(text, key=None):
     """Blocking Voicebox TTS of pre-cleaned text. None on any failure."""
     if not VOICEBOX_URL or not (text or "").strip():
         return None
-    text = text.strip()
-    pid = get_voicebox_profile_id(key)
-    if not pid:
+    return tts_wav_clean_pid(text.strip(), get_voicebox_profile_id(key))
+
+
+def tts_wav_clean_pid(text, pid):
+    """Blocking Voicebox TTS with an explicit profile id. None on failure."""
+    if not VOICEBOX_URL or not (text or "").strip() or not pid:
         return None
+    text = text.strip()
     hit = _tts_cache_get(pid, text)
     if hit is not None:
         return hit
@@ -1386,6 +1390,25 @@ def tts_wav_clean(text, key=None):
     note_voicebox_result(True)
     _tts_cache_put(pid, text, body)
     return body
+
+
+def tts_wav_profile(text, profile_name):
+    """Blocking TTS in a named Voicebox profile, else the default voice.
+
+    Unknown names fall back to default with a loud log, never silence.
+    The TTS cache is keyed by profile id, so each voice caches
+    separately."""
+    cleaned = clean_for_tts(text or "")
+    if not cleaned:
+        return None
+    pid = _resolve_profile_name(profile_name) if profile_name else None
+    if pid is None:
+        if profile_name:
+            log.warning("voice %r unknown - using default", profile_name)
+        pid = get_voicebox_profile_id()
+        if not pid:
+            return None
+    return tts_wav_clean_pid(cleaned, pid)
 
 
 def _tts_cache_key(profile_id, text):
@@ -2046,6 +2069,22 @@ def say_targets(path):
     return [int(m.group(1))] if m else []
 
 
+def say_voice_profile(path):
+    """Parse "<profile>__name.txt" (or "<guildid>_<profile>__name.txt").
+
+    Returns the profile name, or None for default voice. Single-underscore
+    names ("hello.txt", "123_hello.txt") are unaffected."""
+    stem = Path(path).stem
+    if "__" not in stem:
+        return None
+    head = stem.split("__", 1)[0]
+    m = re.match(r"^\d+_(.*)$", head)
+    prof = (m.group(1) if m else head).strip()
+    if not prof or prof.isdigit():
+        return None
+    return prof
+
+
 def connected_guild_ids():
     return [g.id for g in client.guilds
             if g.voice_client is not None
@@ -2070,7 +2109,11 @@ async def process_say_file(path):
             and guild_voice_client(g).is_connected()]
     if not live:
         return False  # hold for later; nobody to speak to yet
-    wav = await asyncio.to_thread(tts_wav, text)
+    prof = say_voice_profile(path)
+    if prof:
+        wav = await asyncio.to_thread(tts_wav_profile, text, prof)
+    else:
+        wav = await asyncio.to_thread(tts_wav, text)
     if not wav:
         last = SAY_FAIL_AT.get(str(path), 0.0)
         now = time.monotonic()
@@ -2084,8 +2127,9 @@ async def process_say_file(path):
     for gid in live:
         if await vc_say(gid, wav, VC_TMP):
             ok = True
-            log.info("[guild:%s] say-queue: %s (%d chars)",
-                     gid, path.name, len(text))
+            log.info("[guild:%s] say-queue: %s (%d chars%s)",
+                     gid, path.name, len(text),
+                     f" as {prof}" if prof else "")
     return ok
 
 
