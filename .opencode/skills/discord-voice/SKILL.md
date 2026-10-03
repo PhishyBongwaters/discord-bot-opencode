@@ -50,6 +50,13 @@ Fail-safe: 3 consecutive Voicebox connection failures auto-delete
 with `voice mode on` once Voicebox is back. A dead gateway needs no
 toggle — a down bot simply produces no voice until restarted.
 
+Keep-warm: while this flag exists, the bot re-checks model residency
+every `VOICEBOX_KEEPALIVE_S` seconds (default 300, `0` disables) and
+reloads only lapsed models — instant no-op while warm, so steady-state
+cost is ~zero. Deleting the flag (voice mode off) silences all probes,
+e.g. while a local LLM holds the GPU. Startup and VC-join warmups run
+regardless of the flag.
+
 ## Speak from Discord chat
 
 - `!say <text>` — speaks immediately in VC, no opencode call.

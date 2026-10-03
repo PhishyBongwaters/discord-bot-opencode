@@ -93,7 +93,9 @@ Two-way chat between Discord and opencode. DM the bot, it forwards to `opencode 
 | `TEXT_MAX_PER_MINUTE` | `10` | Max delivered messages per channel per minute (excess held) |
 | `VC_AUTOJOIN` | empty (= disabled) | Voice channel id to join on startup and sit in until restart |
 | `VC_AUTOREJOIN` | `1` | `1` = rejoin the autojoin channel if disconnected unexpectedly (`!leave` still sticks) |
-| `VOICEBOX_WARMUP` | `1` | `1` = one silent TTS at startup so the first real reply skips model-load cost |
+| `VOICEBOX_WARMUP` | `1` | `1` = ensure TTS + Whisper are loaded at startup so the first exchange skips model-load cost |
+| `VOICEBOX_KEEPALIVE_S` | `300` | Seconds between Voicebox keep-warm checks while agent voice mode is on; status-driven (reloads only lapsed models, logs only on change); `0` disables; voice mode off = full silence |
+| `VOICEBOX_WARM_COOLDOWN_S` | `60` | Minimum seconds between VC-join-triggered warmups (a join storm still warms once) |
 | `VOICE_USER_ID` | empty (= skip) | Your Discord user id; `!voiceready` checks you're sitting in the VC with the bot |
 
 `sample.env` shows the same knobs.
@@ -149,6 +151,8 @@ Per-chat control: `!voice off` mutes spoken replies entirely (VC or file), `!voi
 
 **Fail-safe auto-off:** 3 consecutive Voicebox *connection* failures (unreachable/down — not HTTP errors, which mean it's alive) delete the `.opencode/voice-mode.on` flag and log `voice mode auto-disabled`. Say `voice mode on` to re-enable once Voicebox is back. The bot can only detect this while running, so a dead gateway (bot itself down) just means no voice at all until restart.
 
+**Keep-warm:** at startup the bot ensures both models are resident (no cache involved — a cached warmup would never touch Voicebox). Joining a VC — or someone joining the bot's channel — triggers the same check (cooldown-guarded). While agent voice mode is on, a keepalive loop re-checks every `VOICEBOX_KEEPALIVE_S` seconds and reloads only what lapsed (`POST /models/load` for TTS, a half-second silence transcribe for Whisper — both instant no-ops when already warm). Voice mode off means zero probes: safe to share the GPU with a local LLM.
+
 **Say-queue (agent-initiated speech):** the bot watches `SAY_DIR` (default `say_queue/`) every `SAY_POLL` seconds. Drop in a `.txt` file and it speaks it in VC via the same Computer voice — no Discord message needed, no opencode call. Plain `*.txt` plays in every connected VC; `<guildid>_*.txt` targets one server. Files are deleted after speaking; if no VC is connected they're held until one is (TTS failures retry with backoff). This is the path for speaking *from* a shell/agent session: anything that can write a file (including opencode itself mid-turn, or another harness) can make the bot talk. `!say <text>` is the same thing from Discord chat. `!status` shows pending say files.
 
 **Text-queue (agent-initiated messages):** the bot watches `TEXT_DIR` (default `text_queue/`) every `TEXT_POLL` seconds for proactive outbound text — the fire-and-forget path for local tasks and background jobs that need to post to Discord *through* the already-running bot, no inbound message required. Drop in `<channel_id>_<label>.txt` (e.g. `123456789012345678_nightly.txt`) and the bot sends its contents as a message to that channel (works for DMs too — use the DM channel id). Files larger than `TEXT_MAX_BYTES` (default 4000) are truncated with a note rather than skipped; at most `TEXT_MAX_PER_MINUTE` (default 10) messages per channel per minute go out, excess files are held; failed sends back off ~60s and retry; the file is deleted after successful delivery. Empty `TEXT_DIR` disables it. Contrast with `discord-send.py`, which is a standalone one-shot REST sender that talks to Discord directly with the bot token — no gateway, no bot process needed — for shell scripts and CI jobs that just need to send a message themselves.
@@ -199,7 +203,8 @@ counter/auto-off, say-queue consume/hold/speak/backoff, prompt assembly
 (bridge note, model-arg resolution, usage extraction), file-jail
 confinement, inbox pruning, session-state persistence, the guild
 voice-note gate (audio bypasses `@mention`/`!oc`, images/text don't),
-and the provider-first model picker. The tests
+the provider-first model picker, and Voicebox keep-warm (status parsing,
+cold/warm routing, cooldown, gating). The tests
 encode current behavior — if one fails after a change, the change
 altered behavior; fix the code or file a new issue, not the test.
 
@@ -215,5 +220,5 @@ altered behavior; fix the code or file a new issue, not the test.
 - **No reply at all**: check stderr logs (`[dm:...]` / `[guild:...]` lines), verify Message Content intent is on, and that your user id is in `ALLOWED_USER_IDS` (anyone else is silently ignored).
 - **Voice note came back as a file reference, not a transcript**: Voicebox was unreachable, still downloading the Whisper model (first run), or Whisper returned empty twice. The bot falls back to `--file` so nothing is lost — check the bot log for `voicebox STT` lines and retry.
 - **No spoken reply**: `!voice off` mutes TTS per chat (`!status` shows it); empty `VOICEBOX_URL` disables voice globally; TTS failure only ever drops the audio, text always posts. Run `!voiceready` — it pinpoints which side is down.
-- **First reply after idle is slow**: cold Voicebox model load costs ~25s once; the bot sends a silent warmup TTS at startup (`VOICEBOX_WARMUP`, watch for `voice warmup:` in the log). Manually unloading the model in Voicebox UI re-cools it.
+- **First reply after idle is slow**: if the models lapsed, the first exchange pays load cost once; the bot sends a startup ensure (`VOICEBOX_WARMUP`, watch for `voice warmup:` in the log) plus warm-on-join and keepalive to avoid it. Manually unloading the model in Voicebox UI re-cools it.
 - **`!join` says Opus isn't loaded**: the bot needs `libopus-0.x64.dll` next to `bot.py` (or set `OPUS_LIB`), plus `ffmpeg` on PATH. The startup log says which opus path it loaded.

@@ -98,6 +98,14 @@ Config via env (or .env in cwd / ~/.config/opencode-discord/):
                         `!join` afterwards works normally.
     VOICEBOX_WARMUP     "1" = one silent TTS at startup so the first real reply
                         doesn't pay model-load cost (default "1")
+    VOICEBOX_KEEPALIVE_S seconds between Voicebox keep-warm checks while
+                        agent voice mode is on (default 300; 0 disables).
+                        Each check is status-driven and cheap: it reloads
+                        only models that actually lapsed, and logs only on
+                        change. Voice mode off = full silence (e.g. while a
+                        local LLM holds the GPU).
+    VOICEBOX_WARM_COOLDOWN_S  minimum seconds between VC-join-triggered
+                        warmups (default 60; a join storm still warms once).
     VOICE_USER_ID       your Discord user id; used by `!voiceready` to check
                         you're actually sitting in the VC (empty disables that check)
 
@@ -316,6 +324,8 @@ VC_AUTOJOIN = os.environ.get("VC_AUTOJOIN", "").strip()
 VC_AUTOREJOIN = os.environ.get("VC_AUTOREJOIN", "1") == "1"
 VC_AUTOLEAVE_MINUTES = _env_float("VC_AUTOLEAVE_MINUTES", 5.0)
 VOICEBOX_WARMUP = os.environ.get("VOICEBOX_WARMUP", "1") == "1"
+VOICEBOX_KEEPALIVE_S = _env_float("VOICEBOX_KEEPALIVE_S", 300)
+VOICEBOX_WARM_COOLDOWN_S = _env_float("VOICEBOX_WARM_COOLDOWN_S", 60) or 60.0
 VOICE_USER_ID = os.environ.get("VOICE_USER_ID", "").strip()
 
 logging.basicConfig(
@@ -1525,6 +1535,233 @@ def transcribe_audio_file(path):
     return text, duration
 
 
+def _voicebox_get_json(path, timeout=10):
+    """GET a JSON endpoint on Voicebox. Returns obj or None (never raises)."""
+    if not VOICEBOX_URL:
+        return None
+    try:
+        req = urllib.request.Request(
+            f"{VOICEBOX_URL}{path}",
+            headers={"X-Voicebox-Client-Id": "discord-bot"})
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return json.loads(r.read().decode("utf-8", "replace"))
+    except Exception as e:
+        log.debug("voicebox GET %s failed: %s", path, e)
+        return None
+
+
+def voicebox_tts_loaded():
+    """TTS residency from /health. True/False, None when unknown."""
+    obj = _voicebox_get_json("/health")
+    if not isinstance(obj, dict) or "model_loaded" not in obj:
+        return None
+    return bool(obj.get("model_loaded"))
+
+
+def _whisper_loaded_from_status(obj):
+    """True when any whisper-* model reports loaded. False otherwise."""
+    try:
+        models = obj.get("models") if isinstance(obj, dict) else None
+    except AttributeError:
+        return False
+    if not isinstance(models, list):
+        return False
+    for m in models:
+        if isinstance(m, dict) \
+                and str(m.get("model_name", "")).startswith("whisper") \
+                and m.get("loaded"):
+            return True
+    return False
+
+
+def voicebox_whisper_loaded():
+    """Whisper residency from /models/status. True/False/None (unknown)."""
+    obj = _voicebox_get_json("/models/status")
+    if obj is None:
+        return None
+    return _whisper_loaded_from_status(obj)
+
+
+def voicebox_load_tts():
+    """Explicitly load the TTS model (current size). True on 2xx.
+
+    Instant no-op when already loaded - this is the cheap keep-warm
+    primitive (no synthesis, no cache interaction). Never raises."""
+    if not VOICEBOX_URL:
+        return False
+    size = "1.7B"
+    obj = _voicebox_get_json("/health")
+    if isinstance(obj, dict) and obj.get("model_size"):
+        size = str(obj["model_size"])
+    try:
+        req = urllib.request.Request(
+            f"{VOICEBOX_URL}/models/load?model_size={size}", data=b"",
+            method="POST",
+            headers={"X-Voicebox-Client-Id": "discord-bot"})
+        with urllib.request.urlopen(req,
+                                    timeout=VOICEBOX_TIMEOUT) as r:
+            ok = 200 <= r.status < 300
+    except urllib.error.HTTPError as e:
+        log.warning("voicebox load TTS http %s", e.code)
+        note_voicebox_result(True)  # reachable, refused for cause
+        return False
+    except Exception as e:
+        log.warning("voicebox load TTS failed: %s", e)
+        note_voicebox_result(False)  # unreachable -> counts toward auto-off
+        return False
+    note_voicebox_result(True)
+    return ok
+
+
+def voicebox_probe_stt():
+    """Transcribe 0.5s of silence to warm/verify Whisper.
+
+    Returns (ok, seconds). 2xx counts as ok even with empty text -
+    the point is residency, not content. Warms the configured
+    VOICEBOX_STT_MODEL when set, else the server default. Never raises."""
+    if not VOICEBOX_URL:
+        return False, 0.0
+    import struct
+    import uuid
+    import wave
+    buf = io.BytesIO()
+    try:
+        w = wave.open(buf, "wb")
+        w.setnchannels(1)
+        w.setsampwidth(2)
+        w.setframerate(16000)
+        w.writeframes(struct.pack("<" + "h" * 8000, *[0] * 8000))
+        w.close()
+    except Exception as e:
+        log.warning("voice STT probe build failed: %s", e)
+        return False, 0.0
+    data = buf.getvalue()
+    boundary = uuid.uuid4().hex
+    body = io.BytesIO()
+    if VOICEBOX_STT_MODEL:
+        body.write(
+            f"--{boundary}\r\nContent-Disposition: form-data; "
+            f"name=\"model\"\r\n\r\n{VOICEBOX_STT_MODEL}\r\n".encode())
+    body.write(
+        f"--{boundary}\r\nContent-Disposition: form-data; name=\"file\"; "
+        f"filename=\"warmup.wav\"\r\nContent-Type: audio/wav\r\n\r\n".encode())
+    body.write(data)
+    body.write(f"\r\n--{boundary}--\r\n".encode())
+    t0 = time.monotonic()
+    try:
+        req = urllib.request.Request(
+            f"{VOICEBOX_URL}/transcribe", data=body.getvalue(),
+            headers={"Content-Type":
+                     f"multipart/form-data; boundary={boundary}",
+                     "X-Voicebox-Client-Id": "discord-bot"})
+        with urllib.request.urlopen(req, timeout=VOICEBOX_TIMEOUT) as r:
+            ok = 200 <= r.status < 300
+    except urllib.error.HTTPError as e:
+        log.warning("voice STT probe http %s", e.code)
+        note_voicebox_result(True)
+        return False, time.monotonic() - t0
+    except Exception as e:
+        log.warning("voice STT probe failed: %s", e)
+        note_voicebox_result(False)
+        return False, time.monotonic() - t0
+    note_voicebox_result(True)
+    return ok, time.monotonic() - t0
+
+
+async def ensure_voice_models(source):
+    """Make sure TTS + Whisper are resident. Returns (tts_ok, stt_ok, acted).
+
+    Status-driven: cheap /health + /models/status checks first, loads
+    only what actually lapsed. `source` labels the log line
+    (startup/join/keepalive). Never raises."""
+    acted = []
+    tts_ok = stt_ok = False
+    try:
+        tts_loaded = await asyncio.to_thread(voicebox_tts_loaded)
+        if tts_loaded:
+            tts_ok = True
+        elif tts_loaded is False:
+            log.info("voice warm (%s): TTS cold, loading...", source)
+            tts_ok = await asyncio.to_thread(voicebox_load_tts)
+            if tts_ok:
+                acted.append("tts")
+        whisper_loaded = await asyncio.to_thread(voicebox_whisper_loaded)
+        if whisper_loaded:
+            stt_ok = True
+        elif whisper_loaded is False:
+            log.info("voice warm (%s): whisper cold, probing...", source)
+            stt_ok, _dt = await asyncio.to_thread(voicebox_probe_stt)
+            if stt_ok:
+                acted.append("stt")
+        if tts_loaded is None or whisper_loaded is None:
+            note_voicebox_result(False)
+            log.warning("voice warm (%s): voicebox unreachable", source)
+        else:
+            note_voicebox_result(True)
+    except Exception as e:
+        log.warning("voice warm (%s) failed: %s", source, e)
+    return tts_ok, stt_ok, acted
+
+
+VOICE_WARM_LAST = {"t": 0.0}
+
+
+def warm_due():
+    """True when the VC-join warmup cooldown has elapsed."""
+    return (time.monotonic() - VOICE_WARM_LAST["t"]) \
+        >= VOICEBOX_WARM_COOLDOWN_S
+
+
+def trigger_voice_warm(source):
+    """Fire-and-forget model ensure, at most once per cooldown.
+
+    Called on VC joins; startup/keepalive run unconditionally through
+    ensure_voice_models instead. Never raises."""
+    try:
+        if not VOICEBOX_URL or not warm_due():
+            return
+        VOICE_WARM_LAST["t"] = time.monotonic()
+        asyncio.ensure_future(ensure_voice_models(source))
+    except Exception as e:
+        log.debug("voice warm trigger failed: %s", e)
+
+
+def keepalive_wanted():
+    """True when a keep-warm check should run now."""
+    return VOICEBOX_KEEPALIVE_S > 0 and bool(VOICEBOX_URL) \
+        and voice_mode_on()
+
+
+KEEPALIVE_STATE = {"tts": None, "stt": None}
+
+
+async def voice_keepalive():
+    """Periodic status-driven keep-warm while agent voice mode is on.
+
+    Polls residency each cycle; reloads only lapsed models; logs only
+    on change. Voice mode off (e.g. local-LLM-on-GPU sessions) means
+    full silence - no probes at all."""
+    if VOICEBOX_KEEPALIVE_S <= 0 or not VOICEBOX_URL:
+        return
+    log.info("voice keepalive armed (every %gs, voice-mode gated)",
+             VOICEBOX_KEEPALIVE_S)
+    while True:
+        await asyncio.sleep(VOICEBOX_KEEPALIVE_S)
+        if VOICEBOX_KEEPALIVE_S <= 0 or not VOICEBOX_URL:
+            return
+        if not voice_mode_on():
+            continue
+        try:
+            tts_ok, stt_ok, acted = await ensure_voice_models("keepalive")
+            prev = (KEEPALIVE_STATE["tts"], KEEPALIVE_STATE["stt"])
+            KEEPALIVE_STATE["tts"], KEEPALIVE_STATE["stt"] = tts_ok, stt_ok
+            if acted or (prev != (None, None) and prev != (tts_ok, stt_ok)):
+                log.info("voice keepalive: tts=%s stt=%s%s", tts_ok, stt_ok,
+                         f" (reloaded: {','.join(acted)})" if acted else "")
+        except Exception as e:
+            log.warning("voice keepalive failed: %s", e)
+
+
 VC_CHUNK_CHARS = _env_int("VC_CHUNK_CHARS", 400)
 
 
@@ -2011,16 +2248,21 @@ async def autojoin_vc():
 
 
 async def warmup_voice():
-    """One silent TTS so the first real reply skips model-load cost."""
+    """Startup: ensure TTS + Whisper are resident (status-driven, no cache).
+
+    The old silent-TTS warmup became a cache-hit no-op after first boot;
+    this hits the models themselves instead."""
     if not VOICEBOX_WARMUP or not VOICEBOX_URL:
         return
     t0 = time.monotonic()
-    wav = await asyncio.to_thread(tts_wav_clean, "Voice ready.")
+    tts_ok, stt_ok, acted = await ensure_voice_models("startup")
     dt = time.monotonic() - t0
-    if wav:
-        log.info("voice warmup: %d bytes in %.1fs", len(wav), dt)
+    if tts_ok and stt_ok:
+        log.info("voice warmup: tts+stt ready in %.1fs%s", dt,
+                 f" (loaded: {','.join(acted)})" if acted else "")
     else:
-        log.warning("voice warmup failed - first reply will pay load cost")
+        log.warning("voice warmup incomplete after %.1fs (tts=%s stt=%s) - "
+                    "first reply may pay load cost", dt, tts_ok, stt_ok)
 
 
 async def autorejoin_vc(guild_id, delay=10):
@@ -3364,6 +3606,8 @@ async def on_ready():
     await autojoin_vc()
     if VOICEBOX_WARMUP:
         asyncio.ensure_future(warmup_voice())
+    if VOICEBOX_KEEPALIVE_S > 0 and VOICEBOX_URL:
+        asyncio.ensure_future(voice_keepalive())
     if not TREE_SYNCED:
         TREE_SYNCED = True
         for g in client.guilds:
@@ -3383,6 +3627,7 @@ async def on_ready():
 @client.event
 async def on_voice_state_update(member, before, after):
     # Bot was disconnected / moved out: drop queued clips for that guild.
+    # Bot joined/moved into a VC: pre-warm models (cooldown-guarded).
     if member.id == client.user.id:
         guild = getattr(after.channel or before.channel, "guild", None)
         if after.channel is None and guild is not None:
@@ -3392,6 +3637,8 @@ async def on_voice_state_update(member, before, after):
                 VC_EXPECTED_BYE.discard(guild.id)
             elif VC_AUTOREJOIN and VC_AUTOJOIN:
                 asyncio.ensure_future(autorejoin_vc(guild.id))
+        elif after.channel is not None:
+            trigger_voice_warm("vc-join")
         if guild is not None:
             _refresh_autoleave(guild.id)
         return
@@ -3403,6 +3650,18 @@ async def on_voice_state_update(member, before, after):
             guilds.add(g.id)
     for gid in guilds:
         _refresh_autoleave(gid)
+    # Someone joined the bot's channel: pre-warm so the first exchange
+    # doesn't pay model-load cost (cooldown-guarded, never raises).
+    try:
+        if after.channel is not None and not getattr(member, "bot", False):
+            g = getattr(after.channel, "guild", None)
+            vc = getattr(g, "voice_client", None) if g is not None else None
+            if vc is not None and vc.is_connected() \
+                    and getattr(vc, "channel", None) is not None \
+                    and vc.channel.id == after.channel.id:
+                trigger_voice_warm("user-join")
+    except Exception as e:
+        log.debug("user-join warmup check failed: %s", e)
 
 
 def _reaction_allowed(user, author_id):
