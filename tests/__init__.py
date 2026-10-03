@@ -122,9 +122,30 @@ def _build_discord_stub():
     class View:
         def __init__(self, timeout=None):
             self.timeout = timeout
+            self._items = []
 
         def add_item(self, item):
-            pass
+            self._items.append(item)
+
+        def remove_item(self, item):
+            if item in self._items:
+                self._items.remove(item)
+
+        def stop(self):
+            self._stopped = True
+
+    class Select:
+        def __init__(self, placeholder=None, min_values=1, max_values=1):
+            self.placeholder = placeholder
+            self.min_values = min_values
+            self.max_values = max_values
+            self.options = []
+            self.values = []
+            self.callback = None
+
+        def add_option(self, label=None, description=None, value=None):
+            self.options.append({"label": label, "description": description,
+                                 "value": value})
 
     class CommandTree:
         def __init__(self, client):
@@ -164,6 +185,7 @@ def _build_discord_stub():
             self.value = value
 
     ui.View = View
+    ui.Select = Select
     app_commands.CommandTree = CommandTree
     app_commands.describe = describe
     app_commands.autocomplete = autocomplete

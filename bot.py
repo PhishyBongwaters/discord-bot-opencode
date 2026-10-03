@@ -2565,6 +2565,80 @@ MODELS_CACHE = {"at": 0.0, "items": []}
 MODELS_TTL = 3600
 
 
+def group_models_by_provider(items):
+    """Return {provider: [model_name, ...]} sorted by provider and model."""
+    grouped = {}
+    for item in sorted(items):
+        if "/" not in item:
+            continue
+        provider, model = item.split("/", 1)
+        grouped.setdefault(provider, []).append(model)
+    return {provider: sorted(models) for provider, models in sorted(grouped.items())}
+
+
+class ModelPicker(discord.ui.View):
+    """Provider -> model picker for `/model`."""
+    def __init__(self, items, key, timeout=180):
+        super().__init__(timeout=timeout)
+        self.key = key
+        self.grouped = group_models_by_provider(items)
+
+        self.provider_select = discord.ui.Select(
+            placeholder="Choose a provider…",
+            min_values=1,
+            max_values=1,
+        )
+        for provider in self.grouped:
+            self.provider_select.add_option(
+                label=provider,
+                description=f"{len(self.grouped[provider])} model(s)",
+                value=provider,
+            )
+        self.provider_select.callback = self.provider_selected
+        self.add_item(self.provider_select)
+
+        self.model_select = None
+
+    async def provider_selected(self, interaction: discord.Interaction):
+        provider = self.provider_select.values[0]
+        models = self.grouped.get(provider, [])
+
+        if self.model_select is not None:
+            self.remove_item(self.model_select)
+
+        self.model_select = discord.ui.Select(
+            placeholder=f"Choose a {provider} model…",
+            min_values=1,
+            max_values=1,
+        )
+        for model in models:
+            self.model_select.add_option(
+                label=model[:100],
+                value=f"{provider}/{model}",
+            )
+        self.model_select.callback = self.model_selected
+        self.add_item(self.model_select)
+
+        await interaction.response.edit_message(
+            content=f"Provider: `{provider}` — pick a model for this chat.",
+            view=self,
+        )
+
+    async def model_selected(self, interaction: discord.Interaction):
+        chosen = self.model_select.values[0]
+        key = self.key
+
+        MODEL_OVERRIDES[key] = chosen
+        save_state()
+
+        log.info("[%s] model override via picker: %s", key, chosen)
+        self.stop()
+        await interaction.response.send_message(
+            f"model for this chat: `{chosen}`.",
+            ephemeral=True,
+        )
+
+
 def list_models():
     """Live `opencode models` (provider/model lines). None on failure."""
     try:
@@ -2618,7 +2692,7 @@ def resolve_model_arg(arg, items):
         return ("set", a)
     if "/" not in a:
         return ("error", f"bad model `{a}` - use provider/model, e.g. "
-                         "`google/gemini-2.5-flash`.")
+                          "`google/gemini-2.5-flash`.")
     return ("set", a)
 
 
@@ -2630,19 +2704,53 @@ def current_model_s(key):
 
 
 async def model_autocomplete(interaction: discord.Interaction, current: str):
+    """Autocomplete models by provider, not by flat list order.
+
+    Discord allows at most 25 autocomplete choices. The old code could fill the
+    list with the first provider's seemingly "complete" entries and never surface
+    models from other providers. Grouping by provider keeps the selector useful.
+    """
     items = await asyncio.to_thread(get_models)
     cur = (current or "").lower()
+
     out = []
     if not cur or "default".startswith(cur):
         out.append(app_commands.Choice(
-            name="Default (env / opencode default)", value="__clear__"))
-    for it in items:
-        if cur in it.lower():
-            prov, name = it.split("/", 1)
-            out.append(app_commands.Choice(
-                name=f"{name} ({prov})"[:100], value=it))
-        if len(out) >= 25:
-            break
+            name="Default (env / opencode default)",
+            value="__clear__",
+        ))
+
+    if not items:
+        return out
+
+    grouped = group_models_by_provider(items)
+    seen = set()
+
+    def add_choice(provider: str, model: str):
+        full = f"{provider}/{model}"
+        if full in seen:
+            return
+        seen.add(full)
+        out.append(app_commands.Choice(
+            name=f"{model} ({provider})"[:100],
+            value=full,
+        ))
+
+    if cur:
+        for provider, models in grouped.items():
+            for model in models:
+                full = f"{provider}/{model}"
+                if cur in full.lower():
+                    add_choice(provider, model)
+                    if len(out) >= 25:
+                        return out
+    else:
+        for provider, models in grouped.items():
+            for model in models[:5]:
+                add_choice(provider, model)
+                if len(out) >= 25:
+                    return out
+
     return out
 
 
@@ -2650,25 +2758,48 @@ async def model_autocomplete(interaction: discord.Interaction, current: str):
               description="View or switch the opencode model for this chat")
 @app_commands.describe(model="provider/model, or Default to clear")
 @app_commands.autocomplete(model=model_autocomplete)
-async def model_cmd(interaction: discord.Interaction, model: str):
+async def model_cmd(interaction: discord.Interaction, model: str = None):
     if interaction_tier(interaction) < TIER_DJ:
         await interaction.response.send_message(
             "not permitted (`/model` needs DJ+).", ephemeral=True)
         return
+
     key = key_for_interaction(interaction)
-    if not model or model.strip() == "__clear__":
+
+    # No argument: pop the provider -> model picker.
+    if model is None:
+        items = await asyncio.to_thread(get_models)
+        if not items:
+            await interaction.response.send_message(
+                "No models available right now.",
+                ephemeral=True,
+            )
+            return
+        await interaction.response.send_message(
+            "Pick a provider, then a model for this chat.",
+            view=ModelPicker(items, key),
+            ephemeral=True,
+        )
+        return
+
+    if not model.strip() or model.strip() == "__clear__":
         MODEL_OVERRIDES.pop(key, None)
         save_state()
         log.info("[%s] model override cleared", key)
         await interaction.response.send_message(
             "model cleared - back to default.", ephemeral=True)
         return
+
     items = await asyncio.to_thread(get_models)
+
     if items and model not in items:
         await interaction.response.send_message(
-            "unknown model - pick one from the autocomplete list.",
-            ephemeral=True)
+            "unknown model - use the picker below or type `provider/model` exactly.",
+            view=ModelPicker(items, key),
+            ephemeral=True,
+        )
         return
+
     MODEL_OVERRIDES[key] = model
     save_state()
     log.info("[%s] model override: %s", key, model)
