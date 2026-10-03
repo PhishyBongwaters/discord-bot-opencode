@@ -3498,6 +3498,24 @@ async def on_reaction_add(reaction, user):
             await _regen_reply(reaction, info)
 
 
+def _has_transcribable_audio(message):
+    """True when a guild message carries a voice note STT can handle.
+
+    Voice notes carry no text, so they can never include @mention or the
+    !oc prefix. When STT is enabled they bypass the mention/prefix gate;
+    otherwise they would be silently dropped."""
+    return bool(
+        VOICEBOX_TRANSCRIBE
+        and any(
+            is_audio_attachment(
+                getattr(a, "filename", ""),
+                getattr(a, "content_type", None),
+            )
+            for a in (message.attachments or [])
+        )
+    )
+
+
 @client.event
 async def on_message(message):
     if message.author.bot:
@@ -3511,20 +3529,8 @@ async def on_message(message):
     if not is_dm:
         mentioned = client.user in message.mentions
         prefixed = content.startswith(GUILD_PREFIX)
-        # Voice notes carry no text, so they can never include @mention or
-        # !oc prefix. Let audio attachments through on their own when STT
-        # is enabled; otherwise they would be silently dropped.
-        has_voice_note = (
-            VOICEBOX_TRANSCRIBE
-            and any(
-                is_audio_attachment(
-                    getattr(a, "filename", ""),
-                    getattr(a, "content_type", None),
-                )
-                for a in (message.attachments or [])
-            )
-        )
-        if not (mentioned or prefixed or has_voice_note):
+        if not (mentioned or prefixed
+                or _has_transcribable_audio(message)):
             return
         if prefixed:
             content = content[len(GUILD_PREFIX):].strip()
