@@ -3511,7 +3511,20 @@ async def on_message(message):
     if not is_dm:
         mentioned = client.user in message.mentions
         prefixed = content.startswith(GUILD_PREFIX)
-        if not (mentioned or prefixed):
+        # Voice notes carry no text, so they can never include @mention or
+        # !oc prefix. Let audio attachments through on their own when STT
+        # is enabled; otherwise they would be silently dropped.
+        has_voice_note = (
+            VOICEBOX_TRANSCRIBE
+            and any(
+                is_audio_attachment(
+                    getattr(a, "filename", ""),
+                    getattr(a, "content_type", None),
+                )
+                for a in (message.attachments or [])
+            )
+        )
+        if not (mentioned or prefixed or has_voice_note):
             return
         if prefixed:
             content = content[len(GUILD_PREFIX):].strip()
