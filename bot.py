@@ -3009,7 +3009,7 @@ async def handle_text_command(message, content, key):
                  if message.attachments else "")
         await message.channel.send(
             "DM me anything and I'll run it through opencode.\n"
-            "`!new` - fresh session (plain message, not /new)\n"
+            "`!new` - fresh session\n"
             "`!status` - session, usage, inbox, queue\n"
             "`!voice [on|off]` - spoken replies via Voicebox (Computer voice)\n"
             "`!voiceprofile [name-or-id|clear]` - per-chat voice profile\n"

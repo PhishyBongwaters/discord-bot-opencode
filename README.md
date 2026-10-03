@@ -4,7 +4,7 @@ Two-way chat between Discord and opencode. DM the bot, it forwards to `opencode 
 
 - DMs: any message goes to opencode (per-user session)
 - Servers: `@bot` mention or `!oc <prompt>` (per-channel session)
-- `!new`: start a fresh opencode session (plain message with `!`, **not** `/new` — there are no slash commands)
+- `!new` / `/new`: start a fresh opencode session
 - `!status`: session id, model, voice/VC state, say-queue pending, turns, tokens, cost, inbox, queue state
 - `!voice [on|off]`: spoken replies via Voicebox (Computer voice); `!join` / `!leave`: speak replies in your voice channel (servers)
 - `!say <text>`: speak a line in VC now, no opencode call; `!skip`: stop the current VC clip and drop the queue (stays connected); `!voiceready`: readiness check (voicebox + discord + VC + you-in-VC)
@@ -126,7 +126,7 @@ Model-driven moves/writes require `OPENCODE_AUTO=1` (or an agent that can approv
 
 Full async voice loop backed by Voicebox (`VOICEBOX_URL`, on by default — no `PyNaCl`/`davey`/Opus needed for any of this):
 
-- **You → bot:** record a Discord voice note (or attach audio). The bot transcribes it via Voicebox Whisper and opencode sees `[Voice message voice-message.ogg (12.4s): ...]`. Send a note alone or with text. If transcription fails, the raw file falls back to `--file`.
+- **You → bot:** record a Discord voice note (or attach audio). The bot transcribes it via Voicebox Whisper and opencode sees `[Voice message voice-message.ogg (12.4s): ...]`. Send a note alone or with text. In servers, voice notes don't need `@bot`/`!oc` — anything else still does. If transcription fails, the raw file falls back to `--file`.
 - **Bot → you:** every reply is also spoken in `VOICEBOX_PROFILE` (default `Computer`). Speech is capped at `VOICEBOX_MAX_CHARS` (full text always posts); long replies stream sentence-by-sentence (first audio starts while later sentences still generate), short ones go as one clip. Code fences, `[[attach:]]`/`[[react:]]`/`[[say:]]` markers, and markdown links are stripped before speaking. The model is told its reply will be heard, so it front-loads conclusions and keeps code in `[[attach:]]` files — and it can emit `[[say:line]]` (max 3) for spoken-only asides that stay out of the text.
 
 Spoken delivery, in order of preference:
@@ -194,13 +194,15 @@ sentence chunking, `clean_for_tts`, turn-queue coalescing (buffered
 arrivals drain as one follow-up batch), the voicebox readiness
 counter/auto-off, say-queue consume/hold/speak/backoff, prompt assembly
 (bridge note, model-arg resolution, usage extraction), file-jail
-confinement, inbox pruning, and session-state persistence. The tests
+confinement, inbox pruning, session-state persistence, the guild
+voice-note gate (audio bypasses `@mention`/`!oc`, images/text don't),
+and the provider-first model picker. The tests
 encode current behavior — if one fails after a change, the change
 altered behavior; fix the code or file a new issue, not the test.
 
 ## Troubleshooting
 
-- **"application did not respond"**: you used `/new`. Send `!new` as a plain message instead.
+- **"application did not respond"**: the slash command sync hasn't propagated yet (global sync for DMs can take up to an hour). `!new` as a plain message always works.
 - **"unable to help" / content refusal on file moves**: use the direct drop form (attach + `Place this in d:/projects`) — it bypasses the model entirely. Same for sends: `send me D:\files\clip.mp4` uploads without asking the model.
 - **"I don't see any file" / stuck refusal**: the opencode session predates the fix or a failed turn. Send `!new`, then resend the file fresh. Session continuity (`--session`) keeps old context otherwise.
 - **`mkgy2(1)(2)(3).gif`**: same filename re-sent repeatedly; the inbox dedups instead of overwriting. Safe to delete `attachments/` contents.
