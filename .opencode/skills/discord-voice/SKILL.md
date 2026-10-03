@@ -63,6 +63,10 @@ regardless of the flag.
 ## Speak from Discord chat
 
 - `!say <text>` — speaks immediately in VC, no opencode call.
+- `!voiceprofile <name>` — this chat's voice from now on (preset voices
+  use their own engine automatically).
+- Say-queue files can use `<profile>__` to speak one line in another
+  voice without switching.
 - Normal replies are spoken automatically when voice is on.
 - `!voice off` mutes spoken turn-replies for that chat. The say-queue is
   explicit operator intent and always speaks regardless of `!voice`.
