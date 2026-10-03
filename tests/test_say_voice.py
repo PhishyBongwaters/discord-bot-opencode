@@ -37,20 +37,24 @@ class SayVoiceFallback(unittest.TestCase):
     def test_unknown_profile_uses_default(self):
         with mock.patch.object(bot, "_resolve_profile_name",
                                return_value=None), \
+             mock.patch.object(bot, "get_voicebox_profile_engine",
+                               return_value=None), \
              mock.patch.object(bot, "get_voicebox_profile_id",
                                return_value="default-pid"), \
              mock.patch.object(bot, "tts_wav_clean_pid",
                                return_value=b"WAV") as synth:
             self.assertEqual(bot.tts_wav_profile("hi", "nosuchvoice"), b"WAV")
-            synth.assert_called_once_with("hi", "default-pid")
+            synth.assert_called_once_with("hi", "default-pid", None)
 
     def test_named_profile_used(self):
         with mock.patch.object(bot, "_resolve_profile_name",
                                return_value="nicole-pid"), \
+             mock.patch.object(bot, "get_voicebox_profile_engine",
+                               return_value="kokoro"), \
              mock.patch.object(bot, "tts_wav_clean_pid",
                                return_value=b"WAV") as synth:
             self.assertEqual(bot.tts_wav_profile("hi", "Nicole"), b"WAV")
-            synth.assert_called_once_with("hi", "nicole-pid")
+            synth.assert_called_once_with("hi", "nicole-pid", "kokoro")
 
 
 class SayFileVoice(unittest.TestCase):
