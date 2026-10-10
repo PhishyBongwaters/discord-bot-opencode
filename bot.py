@@ -35,6 +35,11 @@ Config via env (or .env in cwd / ~/.config/opencode-discord/):
                         Plain chat, !status, !help: everyone allowed.
     OPENCODE_BIN        default "opencode"
     OPENCODE_DIR        working dir for opencode runs (default cwd)
+    BACKEND             "opencode" (default) or "harness". When "harness",
+                      turns are POSTed to a harness --serve instance
+                      instead of shelling to opencode.
+    HARNESS_URL         harness server URL (default http://127.0.0.1:8080)
+    HARNESS_TIMEOUT     seconds per harness turn (default 600)
     FILE_JAIL         allowlist root for drop targets + send sources
                       (default OPENCODE_DIR; empty also fails closed to
                       OPENCODE_DIR). DMs and guilds share the same rule.
@@ -264,6 +269,12 @@ def interaction_tier(interaction):
     return role_tier(getattr(user, "id", None), member)
 OPENCODE_BIN = os.environ.get("OPENCODE_BIN", "opencode")
 OPENCODE_DIR = os.environ.get("OPENCODE_DIR", os.getcwd())
+# Backend selection: "opencode" (default) or "harness".
+# When BACKEND=harness, turns are POSTed to a harness --serve instance
+# instead of shelling to opencode.
+BACKEND = os.environ.get("BACKEND", "opencode").strip().lower()
+HARNESS_URL = os.environ.get("HARNESS_URL", "http://127.0.0.1:8080").strip()
+HARNESS_TIMEOUT = _env_int("HARNESS_TIMEOUT", 600)
 FILE_JAIL_RAW = os.environ.get("FILE_JAIL", "").strip()
 # Fail-closed: unset or empty FILE_JAIL jails to OPENCODE_DIR. There is
 # deliberately no unlimited mode.
@@ -1076,6 +1087,48 @@ def run_opencode(prompt, session_key, files=None, model=None):
     if not text:
         text = "(opencode returned no text)"
     return text, new_sid
+
+
+def run_harness(prompt, session_key, files=None, model=None):
+    """POST one turn to a harness --serve instance.
+
+    Returns (reply_text, session_id_or_None). The harness server manages
+    sessions; we pass our session_key through as the session ID.
+    Files and model override are not supported over HTTP (yet) — logged
+    and ignored.
+    """
+    import urllib.request
+    if files:
+        log.warning("[%s] harness backend: %d files ignored "
+                    "(not supported over HTTP)", session_key, len(files))
+    if model:
+        log.warning("[%s] harness backend: model override ignored "
+                    "(not supported over HTTP)", session_key)
+    payload = json.dumps({"session": session_key,
+                          "message": prompt}).encode()
+    url = HARNESS_URL.rstrip("/") + "/turn"
+    log.info("[%s] harness POST %s (%d chars)",
+             session_key, url, len(prompt))
+    try:
+        req = urllib.request.Request(
+            url, data=payload,
+            headers={"Content-Type": "application/json"})
+        with urllib.request.urlopen(req,
+                                    timeout=HARNESS_TIMEOUT) as r:
+            data = json.loads(r.read().decode("utf-8", "replace"))
+    except Exception as e:
+        log.error("[%s] harness backend failed: %s", session_key, e)
+        return f"harness backend error: {e}", None
+    reply = data.get("response", "") or "(harness returned no text)"
+    sid = data.get("session")
+    return reply, sid
+
+
+def run_backend(prompt, session_key, files=None, model=None):
+    """Dispatch to the configured backend (opencode or harness)."""
+    if BACKEND == "harness":
+        return run_harness(prompt, session_key, files, model)
+    return run_opencode(prompt, session_key, files, model)
 
 
 def safe_key(key):
@@ -2833,7 +2886,7 @@ async def run_batches(key, channel, q, batch, inbox, status,
             try:
                 async with channel.typing():
                     reply, new_sid = await asyncio.to_thread(
-                        run_opencode, combined, key, files,
+                        run_backend, combined, key, files,
                         MODEL_OVERRIDES.get(key))
             except TurnCancelled:
                 log.info("[%s] turn cancelled, no reply posted", key)

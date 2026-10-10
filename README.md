@@ -63,6 +63,9 @@ Two-way chat between Discord and opencode. DM the bot, it forwards to `opencode 
 | `OPENCODE_AGENT` | empty | Passed as `--agent` |
 | `OPENCODE_AUTO` | `0` | Set `1` to pass `--auto` (auto-approve tools). Required for unattended file moves/writes. Only for users you trust |
 | `OPENCODE_TIMEOUT` | `600` | Seconds per run |
+| `BACKEND` | `opencode` | `"opencode"` or `"harness"`. When `"harness"`, turns POST to a `harness --serve` instance instead of shelling to opencode |
+| `HARNESS_URL` | `http://127.0.0.1:8080` | Harness server URL (when `BACKEND=harness`) |
+| `HARNESS_TIMEOUT` | `600` | Seconds per harness turn |
 | `MAX_CONCURRENT_TURNS` | `2` | Max simultaneous opencode runs across all chats; extra turns wait FIFO (see `!status`); `0` = unlimited |
 | `STATE_FILE` | `state/sessions.json` | Maps Discord session key -> opencode session id |
 | `GUILD_PREFIX` | `!oc` | Server-channel prefix |
@@ -184,6 +187,25 @@ python discord-send.py --list
 ```
 
 With `DEFAULT_DISCORD_CHANNEL` set in `.env`, omit `--to`. Targets: `#name`, `<channel_id>`, `channel:<id>`, `dm:<user_id>`, `user:<id>`, `@<id>`. Exit codes: 0 ok, 1 delivery failure, 2 usage error. Requires `chunking.py` alongside for fence-aware splitting. Retries Discord 429s (up to 3, honors `retry_after`).
+
+## Harness backend
+
+The bot can use a [context-harness](https://github.com/PhishyBongwaters/Context-harness)
+server instead of opencode. Start the harness first:
+
+```
+harness --serve --port 8080
+```
+
+Then set in `.env`:
+```
+BACKEND=harness
+HARNESS_URL=http://127.0.0.1:8080
+```
+
+Turns are POSTed to `HARNESS_URL/turn` as `{"session": "<key>", "message": "<prompt>"}`.
+The harness holds a persistent `Loop` per session — no subprocess startup per message.
+File attachments and per-turn model overrides are not supported over HTTP (logged and ignored).
 
 ## Tests
 
